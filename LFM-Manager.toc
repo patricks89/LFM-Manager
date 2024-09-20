@@ -1,0 +1,7 @@
+## Interface: 11403
+## Title: LFM-Manager
+## Notes: Custom Raid Management Addon
+## Author: Patrick S.
+## Version: 1.0
+## SavedVariables: LFM-ManagerDB
+LFM-Manager.lua
