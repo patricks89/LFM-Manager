@@ -5,3 +5,4 @@ C:\Program Files (x86)\World of Warcraft\_classic_era_\Interface\AddOns\LFM-Mana
 Put in the LFM-Manager files in that directory and start WOW!
 
 <img src="https://github.com/patricks89/LFM-Manager/blob/main/1.png"></img>
+<img src="https://github.com/patricks89/LFM-Manager/blob/main/2.png"></img>
