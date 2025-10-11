@@ -68,6 +68,8 @@ local raidConfigDefaults = deepCopy(raidConfig)
 local selectedRaid           = "SCHOLO"
 local autoReplyInviteEnabled = false
 local selectedChannels       = {}  -- map[str]=true
+local lfmAutoPostTimer       = nil
+local uiStatusTickerTimer    = nil
 
 -- Rollen-/Pending-Listen (runtime)
 local activeTank, activeHealer, activeRange, activeMelee = {}, {}, {}, {}
@@ -89,6 +91,53 @@ local function PersistActiveRoles()
   for _,n in ipairs(activeHealer) do table.insert(db.activeRoles.healer, n); db.roleAssignments[n]="healer" end
   for _,n in ipairs(activeRange)  do table.insert(db.activeRoles.range, n);  db.roleAssignments[n]="range"  end
   for _,n in ipairs(activeMelee)  do table.insert(db.activeRoles.melee, n);  db.roleAssignments[n]="melee"  end
+end
+
+-- Compact role assignment window (reliable buttons), opens at cursor and toggles on repeated clicks
+function MyRaidAddon:OpenAssignWindow(name, anchorFrame)
+  if self._assignWin and self._assignWin.frame and self._assignWin.frame:IsShown() then
+    if self._assignAnchor == anchorFrame then
+      self._assignWin.frame:Hide(); self._assignWin = nil; self._assignAnchor = nil; return
+    else
+      self._assignWin.frame:Hide(); self._assignWin = nil; self._assignAnchor = nil
+    end
+  end
+  local frame = AceGUI:Create("Window")
+  frame:SetTitle("Assign Role: "..(name or ""))
+  frame:SetLayout("List")
+  frame:SetWidth(240)
+  frame:SetHeight(220)
+  frame:SetCallback("OnClose", function(w)
+    if MyRaidAddon and MyRaidAddon._assignWin == w then MyRaidAddon._assignWin = nil; MyRaidAddon._assignAnchor = nil end
+    AceGUI:Release(w)
+  end)
+  local roles = {
+    { key="tank",  label="Tank" },
+    { key="healer",label="Healer" },
+    { key="range", label="Range DPS" },
+    { key="melee", label="Melee DPS" },
+  }
+  for _,r in ipairs(roles) do
+    local b = AceGUI:Create("Button"); b:SetText(r.label); b:SetWidth(200)
+    b:SetCallback("OnClick", function()
+      MyRaidAddon:AssignRoleAndPersist(name, r.key)
+      frame:Hide()
+      if MyRaidAddon and MyRaidAddon.UpdateRoleManagementPage then MyRaidAddon:UpdateRoleManagementPage() end
+      if RebuildActiveTab then RebuildActiveTab() end
+    end)
+    frame:AddChild(b)
+  end
+  local rem = AceGUI:Create("Button"); rem:SetText("Remove from Roles"); rem:SetWidth(200)
+  rem:SetCallback("OnClick", function()
+    removeFromAllActiveLists(name)
+    MyRaidAddon:AddToInvitedPlayers(name, nil, "invited")
+    PersistActiveRoles()
+    updatePlayersWithoutRole(); updatePlayerStatuses()
+    MyRaidAddon:UpdateRoleManagementPage(); frame:Hide(); RebuildActiveTab()
+  end)
+  frame:AddChild(rem)
+  if openAtCursor then openAtCursor(frame) end
+  self._assignWin = frame; self._assignAnchor = anchorFrame
 end
 
 local function LoadActiveRolesFromDB()
@@ -155,7 +204,7 @@ role=range
 invite=true
 stop=true
 
-# ---------- 2) Class → role (auto-assign) ----------
+# ---------- 2) Class ? role (auto-assign) ----------
 rule:
 keywords=mage
 match=any
@@ -340,28 +389,28 @@ local DEFAULT_SORT_TEXT = [[
 # Syntax: key=value pairs, one group per block
 # Empty lines and "#" comments are ignored.
 #
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # GLOBAL RULES
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # Use lines starting with "Global=" for rules that affect the entire raid.
 #
 # Examples:
-#   Global=require Shaman>=4          → ensures at least 4 shamans in the raid
-#   Global=avoid Healer>10            → limits healers to a maximum of 10
-#   Global=prefer Druid,Hunter        → prioritizes these classes when sorting
+#   Global=require Shaman>=4          ? ensures at least 4 shamans in the raid
+#   Global=avoid Healer>10            ? limits healers to a maximum of 10
+#   Global=prefer Druid,Hunter        ? prioritizes these classes when sorting
 #
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # GROUP RULES
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # Each group block begins with "Grp=" and can contain:
 #
 #   wants=Tag
 #       Defines the primary focus of this group (Tank, Melee, Range, Healer)
 #       Controls what kind of players will fill the remaining slots.
 #       Examples:
-#         wants=Melee   → fills with melee DPS
-#         wants=Range   → fills with ranged DPS
-#         wants=Healer  → fills with healers
+#         wants=Melee   ? fills with melee DPS
+#         wants=Range   ? fills with ranged DPS
+#         wants=Healer  ? fills with healers
 #
 #   require X[,Y]
 #       Enforces minimum quotas or mandatory roles/classes.
@@ -386,14 +435,14 @@ local DEFAULT_SORT_TEXT = [[
 #   wants + require + avoid + prefer
 #       are sufficient — "definition=" is no longer needed.
 #       The algorithm works in this order:
-#         1️⃣ fill required slots (require)
-#         2️⃣ apply preferred classes (prefer)
-#         3️⃣ respect avoid rules
-#         4️⃣ fill remaining spots with the tag from "wants"
+#         1?? fill required slots (require)
+#         2?? apply preferred classes (prefer)
+#         3?? respect avoid rules
+#         4?? fill remaining spots with the tag from "wants"
 #
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # OPERATOR REFERENCE
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #   =   exactly equal
 #   >=  at least
 #   <=  at most
@@ -401,17 +450,17 @@ local DEFAULT_SORT_TEXT = [[
 #   <   less than
 #   !=  not equal
 #
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # COMMON USE CASES
-# ─────────────────────────────────────────────
-#   require Shaman>=1           → ensures Windfury/Mana Totem in group
-#   prefer Druid,Hunter         → favors Feral (Leader of the Pack) / Tranq Hunter
-#   avoid Healer>1              → avoids healers in melee cores
-#   wants=Range                 → auto-fills with casters/ranged DPS
+# ---------------------------------------------
+#   require Shaman>=1           ? ensures Windfury/Mana Totem in group
+#   prefer Druid,Hunter         ? favors Feral (Leader of the Pack) / Tranq Hunter
+#   avoid Healer>1              ? avoids healers in melee cores
+#   wants=Range                 ? auto-fills with casters/ranged DPS
 #
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # NOTES
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # - "wants" replaces the old "GrpType" field.
 # - "definition=" is deprecated in Sort Rules+.
 # - Global rules apply across all groups.
@@ -524,6 +573,20 @@ local function getFullPlayerName(name)
   return name
 end
 
+-- Helper: run a /who query for a player or query string
+local function doWhoQuery(query)
+  if not query or query=="" then return end
+  if SendWho then
+    SendWho(query)
+  elseif C_FriendList and C_FriendList.SendWho then
+    C_FriendList.SendWho(query)
+  elseif C_FriendsList and C_FriendsList.SendWho then
+    C_FriendsList.SendWho(query)
+  else
+    if ChatFrame_OpenChat then ChatFrame_OpenChat("/who "..query) end
+  end
+end
+
 local function currentRaidCfg() return raidConfig[selectedRaid] end
 
 local function inAnyActiveList(name)
@@ -565,6 +628,18 @@ local function removeFromAllActiveLists(name)
   -- auch persistent entfernen
   local db = MyRaidAddon.db and MyRaidAddon.db.profile or nil
   if db and db.roleAssignments then db.roleAssignments[name]=nil end
+  PersistActiveRoles()
+end
+
+-- Entfernt einen Spieler aus den aktiven Rollen, behält aber die zuletzt gewählte Rolle in roleAssignments bei.
+local function removeFromActiveListsKeepAssignment(name)
+  listRemove(activeTank, name)
+  listRemove(activeHealer, name)
+  listRemove(activeRange, name)
+  listRemove(activeMelee, name)
+  listRemove(conversationList, name)
+  listRemove(playersWithoutRole, name)
+  -- Wichtig: roleAssignments NICHT löschen – so kann die Rolle beim Rejoin wiederhergestellt werden.
   PersistActiveRoles()
 end
 
@@ -625,7 +700,27 @@ local function InviteIfNotExcluded(name)
     print("|cffff5555[LFM]|r "..name.." is excluded and will not be invited.")
     return
   end
-  InviteUnit(name)
+  -- Auto-Konvertierung: Wenn Party bereits 5 Spieler hat und kein Raid, vor der Einladung zu Raid wechseln
+  local num = (GetNumGroupMembers and GetNumGroupMembers()) or 0
+  local inRaid = IsInRaid and IsInRaid() or false
+  local function isLeader()
+    if UnitIsGroupLeader and UnitIsGroupLeader("player") then return true end
+    if IsPartyLeader and IsPartyLeader() then return true end
+    if IsRaidLeader and IsRaidLeader() then return true end
+    if (IsInGroup and not IsInGroup()) or (not GetNumGroupMembers or num==0) then return true end
+    return false
+  end
+  local converted = false
+  if not inRaid and num >= 5 and ConvertToRaid and isLeader() then
+    ConvertToRaid()
+    converted = true
+    print("|cff55ff55[LFM]|r Auto-converted to Raid for inviting "..name)
+  end
+  if converted and C_Timer and C_Timer.After then
+    C_Timer.After(0.2, function() InviteUnit(name) end)
+  else
+    InviteUnit(name)
+  end
 end
 
 -- ==============================
@@ -679,10 +774,19 @@ local function updatePlayersWithoutRole()
   for _, nm in ipairs(conversationList) do
     if nm and not inAnyActiveList(nm) then listAddUnique(playersWithoutRole, nm) end
   end
-  local db = MyRaidAddon.db.profile.invitedPlayers
-  for nm, data in pairs(db) do
-    if data and data.status ~= "Excluded" and isPlayerInGroup(nm) then
+  -- Auch Spieler berücksichtigen, die (noch) nicht in der Gruppe sind
+  local invited = MyRaidAddon.db.profile.invitedPlayers
+  for nm, data in pairs(invited) do
+    if data and data.status ~= "Excluded" then
       if not inAnyActiveList(nm) then listAddUnique(playersWithoutRole, nm) end
+    end
+  end
+  -- Und zuletzt gespeicherte Rollen (roleAssignments) berücksichtigen, falls Spieler nicht in invitedPlayers stehen
+  local ra = MyRaidAddon.db.profile.roleAssignments or {}
+  for nm, _ in pairs(ra) do
+    local rec = invited[nm]
+    if (not rec or rec.status ~= "Excluded") and not inAnyActiveList(nm) then
+      listAddUnique(playersWithoutRole, nm)
     end
   end
   local me = getFullPlayerName(GetUnitName("player", true))
@@ -1054,13 +1158,13 @@ end
 local function scoreCandidate(name, wantsTags, avoidSet, preferList)
   local score = 0
   local cls = (getClassOf(name) or "UNKNOWN"):upper()
-  -- wants: simple tag→class/spec mapping
+  -- wants: simple tag?class/spec mapping
   for _,tag in ipairs(wantsTags or {}) do
     local sat = TAG_TO_SATISFIERS[tag]
     if sat then
       if sat[cls] == true then score = score + 2
       elseif type(sat[cls])=="string" then
-        -- spec hint in name not available → mild bonus
+        -- spec hint in name not available ? mild bonus
         score = score + 1
       end
     end
@@ -1317,7 +1421,12 @@ local function RebuildActiveTab()
   if not tabGroup or not tabGroup.GetSelected then return end
   local sel = tabGroup:GetSelected()
   if not sel then return end
-  tabGroup:SelectTab(sel)
+  -- Erzwinge Neuaufbau, auch wenn derselbe Tab ausgewählt ist
+  if SelectTab then
+    SelectTab(tabGroup, nil, sel)
+  else
+    tabGroup:SelectTab(sel)
+  end
 end
 
 -- ==============================
@@ -1526,6 +1635,65 @@ local function calcRaidProgress()
   return math.floor(((cur / cfg.RaidSize) * 100) + 0.5)
 end
 
+function MyRaidAddon:UpdateStatusBar()
+  if not mainFrame or not mainFrame.SetStatusText then return end
+
+  local cfg = currentRaidCfg() or { NeedTanks=0, NeedHealers=0, NeedDPS=0, RaidSize=0 }
+  local haveT, haveH = #activeTank, #activeHealer
+  local haveR, haveM = #activeRange, #activeMelee
+  local haveD        = haveR + haveM
+  local needT, needH, needD = cfg.NeedTanks or 0, cfg.NeedHealers or 0, cfg.NeedDPS or 0
+
+  -- Ready (in group & online & role assigned)
+  local unitByName, isOnline = {}, {}
+  for unit in IterateGroup() do
+    local nm = GetUnitName(unit, true)
+    if nm then nm = getFullPlayerName(nm); unitByName[nm] = unit; isOnline[nm] = UnitIsConnected(unit) and true or false end
+  end
+  local function countReady(list)
+    local n=0; for _,nm in ipairs(list) do if unitByName[nm] and isOnline[nm] then n=n+1 end end; return n
+  end
+  local readyT = countReady(activeTank)
+  local readyH = countReady(activeHealer)
+  local readyR = countReady(activeRange)
+  local readyM = countReady(activeMelee)
+  local readyD = readyR + readyM
+  local readyTotal = readyT + readyH + readyD
+
+  -- Color helper
+  local function colorize(curr, need)
+    local col = "ffff5555" -- red
+    if need <= 0 then col = "ffffffff"
+    elseif curr >= need then col = "55ff55ff" -- green
+    elseif curr > 0 then col = "ffffcc00" -- yellow
+    end
+    return string.format("|c%s%d|r/%d", col, curr, need)
+  end
+
+  local roleSummary = string.format("T %s H %s D %s (R %d, M %d)", colorize(haveT,needT), colorize(haveH,needH), colorize(haveD,needD), haveR, haveM)
+
+  local missingParts = {}
+  if haveT < needT then table.insert(missingParts, string.format("T%d", needT - haveT)) end
+  if haveH < needH then table.insert(missingParts, string.format("H%d", needH - haveH)) end
+  if haveD < needD then table.insert(missingParts, string.format("D%d", needD - haveD)) end
+  local missingStr = (#missingParts>0) and (" | Missing: "..table.concat(missingParts, ", ")) or " | Missing: 0"
+
+  local progress = calcRaidProgress()
+  local totalIlvl = calcTotalIlvl()
+
+  -- No-Role count (pending)
+  updatePlayersWithoutRole()
+  local pending = 0; for _,nm in ipairs(playersWithoutRole) do if nm and not inAnyActiveList(nm) then pending = pending + 1 end end
+
+  local readyStr = string.format(" | Ready: %d in grp/online", readyTotal)
+
+  local extra = ""
+
+  local text = string.format("%s%s | Pending: %d | Progress: %d%% | ilvl: %d%s",
+    roleSummary, missingStr, pending, progress, totalIlvl, extra)
+  mainFrame:SetStatusText(text)
+end
+
 local function buildMainTab(container)
   container:ReleaseChildren()
   local scroll = AceGUI:Create("ScrollFrame"); scroll:SetLayout("Flow"); scroll:SetFullWidth(true); scroll:SetFullHeight(true); container:AddChild(scroll)
@@ -1535,6 +1703,8 @@ local function buildMainTab(container)
   local postBtn = AceGUI:Create("Button"); postBtn:SetText("Post LFM"); postBtn:SetWidth(120)
   postBtn:SetCallback("OnClick", function() postRaid(selectedRaid) end)
   top:AddChild(postBtn)
+
+  -- Auto Post LFM removed to comply with policies
 
   local autoAll = AceGUI:Create("CheckBox")
   autoAll:SetLabel("Auto Reply+Invite (enables Whisper Rules)")
@@ -1546,14 +1716,54 @@ local function buildMainTab(container)
   end)
   top:AddChild(autoAll)
 
-  if mainFrame and mainFrame.SetStatusText then
-    mainFrame:SetStatusText(string.format("LFM Progress: %d%% - Total ilvl: %d", calcRaidProgress(), calcTotalIlvl()))
-  end
+  if MyRaidAddon and MyRaidAddon.UpdateStatusBar then MyRaidAddon:UpdateStatusBar() end
 
   local raidGrp = AceGUI:Create("InlineGroup"); raidGrp:SetTitle("Raid Settings"); raidGrp:SetLayout("Flow"); raidGrp:SetFullWidth(true); scroll:AddChild(raidGrp)
 
   local raidList = {}; for k,v in pairs(raidConfig) do raidList[k]=v.RaidName end
   local cfg = currentRaidCfg()
+
+  -- Links row (SR + Discord) with raid-warning option and post button
+  MyRaidAddon.db.profile.srLink = MyRaidAddon.db.profile.srLink or ""
+  MyRaidAddon.db.profile.discordLink = MyRaidAddon.db.profile.discordLink or ""
+  if type(MyRaidAddon.db.profile.raidWarnEnabled) ~= "boolean" then MyRaidAddon.db.profile.raidWarnEnabled = false end
+
+  local row0 = AceGUI:Create("SimpleGroup"); row0:SetFullWidth(true); row0:SetLayout("Flow"); raidGrp:AddChild(row0)
+
+  local ebSR = AceGUI:Create("EditBox"); ebSR:SetLabel("SR Link"); ebSR:SetText(MyRaidAddon.db.profile.srLink or ""); ebSR:SetRelativeWidth(0.4); row0:AddChild(ebSR)
+  ebSR:SetCallback("OnTextChanged", function(_,_,txt) MyRaidAddon.db.profile.srLink = txt or "" end)
+
+  local ebDisc = AceGUI:Create("EditBox"); ebDisc:SetLabel("Discord Link"); ebDisc:SetText(MyRaidAddon.db.profile.discordLink or ""); ebDisc:SetRelativeWidth(0.4); row0:AddChild(ebDisc)
+  ebDisc:SetCallback("OnTextChanged", function(_,_,txt) MyRaidAddon.db.profile.discordLink = txt or "" end)
+
+  local cbRW = AceGUI:Create("CheckBox"); cbRW:SetLabel("Raid Warning (/rw)"); cbRW:SetValue(MyRaidAddon.db.profile.raidWarnEnabled); cbRW:SetWidth(150); row0:AddChild(cbRW)
+  cbRW:SetCallback("OnValueChanged", function(_,_,v) MyRaidAddon.db.profile.raidWarnEnabled = v and true or false end)
+
+  local function postLinks()
+    local sr = (MyRaidAddon.db.profile.srLink or ""):match("%S") and MyRaidAddon.db.profile.srLink or nil
+    local dc = (MyRaidAddon.db.profile.discordLink or ""):match("%S") and MyRaidAddon.db.profile.discordLink or nil
+    if not sr and not dc then print("|cffffaa00[LFM]|r No links to post.") return end
+    local inRaid = IsInRaid()
+    local inGroup = IsInGroup()
+    local chatType
+    if inRaid then
+      if MyRaidAddon.db.profile.raidWarnEnabled and (UnitIsGroupLeader("player") or UnitIsGroupAssistant("player")) then
+        chatType = "RAID_WARNING"
+      else
+        chatType = "RAID"
+      end
+    elseif inGroup then
+      chatType = "PARTY"
+    else
+      print("|cffffaa00[LFM]|r Not in party/raid; cannot post to group.")
+      return
+    end
+    if sr then SendChatMessage("SR: "..sr, chatType) end
+    if dc then SendChatMessage("Discord: "..dc, chatType) end
+  end
+
+  local btnPostLinks = AceGUI:Create("Button"); btnPostLinks:SetText("Post Links"); btnPostLinks:SetWidth(120); row0:AddChild(btnPostLinks)
+  btnPostLinks:SetCallback("OnClick", function() postLinks() end)
 
   local row1 = AceGUI:Create("SimpleGroup"); row1:SetFullWidth(true); row1:SetLayout("Flow"); raidGrp:AddChild(row1)
   local dd = AceGUI:Create("Dropdown"); dd:SetLabel("Select Dungeon/Raid"); dd:SetList(raidList); dd:SetValue(selectedRaid); dd:SetRelativeWidth(0.5); row1:AddChild(dd)
@@ -1635,26 +1845,32 @@ local function buildRolesTab(container)
   local announceBtn = AceGUI:Create("Button"); announceBtn:SetText("Announce Roles"); announceBtn:SetWidth(140)
   announceBtn:SetCallback("OnClick", function() announceActiveLists() end); top:AddChild(announceBtn)
 
-  local rolesDef = {
-    { label="Tanks",     list=activeTank,   key="tank" },
-    { label="Healers",   list=activeHealer, key="healer" },
-    { label="Range DPS", list=activeRange,  key="range" },
-    { label="Melee DPS", list=activeMelee,  key="melee" },
-  }
+  -- Filter für "Without Role"-Liste
+  MyRaidAddon.db.profile.noRoleFilter = MyRaidAddon.db.profile.noRoleFilter or { onlyGroup=false, onlyOnline=false, maxRows=10 }
+  local noRoleFilter = MyRaidAddon.db.profile.noRoleFilter
 
-  local function assignRoleAndPersist(name, roleKey)
-    removeFromAllActiveLists(name)
-    if roleKey=="tank" then table.insert(activeTank,name)
-    elseif roleKey=="healer" then table.insert(activeHealer,name)
-    elseif roleKey=="range" then table.insert(activeRange,name)
-    elseif roleKey=="melee" then table.insert(activeMelee,name) end
-    InviteIfNotExcluded(name)
-    MyRaidAddon:AddToInvitedPlayers(name, roleKey, isPlayerInGroup(name) and "active" or "invited")
-    PersistActiveRoles()
-    updatePlayersWithoutRole(); updatePlayerStatuses()
-    MyRaidAddon:UpdateRoleManagementPage()
-    RebuildActiveTab()
-  end
+  local cbOnlyGroup = AceGUI:Create("CheckBox"); cbOnlyGroup:SetLabel("Only Group"); cbOnlyGroup:SetValue(noRoleFilter.onlyGroup or false); cbOnlyGroup:SetWidth(120)
+  cbOnlyGroup:SetCallback("OnValueChanged", function(_,_,v)
+    noRoleFilter.onlyGroup = v and true or false
+    MyRaidAddon:UpdateRoleManagementPage(); RebuildActiveTab()
+  end); top:AddChild(cbOnlyGroup)
+
+  local cbOnlyOnline = AceGUI:Create("CheckBox"); cbOnlyOnline:SetLabel("Only Online"); cbOnlyOnline:SetValue(noRoleFilter.onlyOnline or false); cbOnlyOnline:SetWidth(120)
+  cbOnlyOnline:SetCallback("OnValueChanged", function(_,_,v)
+    noRoleFilter.onlyOnline = v and true or false
+    MyRaidAddon:UpdateRoleManagementPage(); RebuildActiveTab()
+  end); top:AddChild(cbOnlyOnline)
+
+  local ebMax = AceGUI:Create("EditBox"); ebMax:SetLabel("Max Rows"); ebMax:SetText(tostring(noRoleFilter.maxRows or 10)); ebMax:SetWidth(110)
+  ebMax:SetCallback("OnTextChanged", function(_,_,txt)
+    local n = tonumber(txt) or noRoleFilter.maxRows or 10
+    if n < 1 then n = 1 end; if n > 500 then n = 500 end
+    noRoleFilter.maxRows = n
+  end)
+  ebMax:SetCallback("OnEnterPressed", function()
+    MyRaidAddon:UpdateRoleManagementPage(); RebuildActiveTab()
+  end); top:AddChild(ebMax)
+
 
   local function ShowPlayerOptions(name)
     local frame = AceGUI:Create("Window")
@@ -1666,7 +1882,7 @@ local function buildRolesTab(container)
     }
     for _,r in ipairs(roles) do
       local b = AceGUI:Create("Button"); b:SetText(r.label); b:SetWidth(200)
-      b:SetCallback("OnClick", function() assignRoleAndPersist(name, r.key); frame:Hide() end)
+      b:SetCallback("OnClick", function() MyRaidAddon:AssignRoleAndPersist(name, r.key); frame:Hide() end)
       frame:AddChild(b)
     end
     local rem = AceGUI:Create("Button"); rem:SetText("Remove from Roles"); rem:SetWidth(200)
@@ -1678,66 +1894,176 @@ local function buildRolesTab(container)
       MyRaidAddon:UpdateRoleManagementPage(); frame:Hide(); RebuildActiveTab()
     end)
     frame:AddChild(rem)
+    -- Open the picker near the cursor for faster workflow
+    if openAtCursor then openAtCursor(frame) end
   end
 
-  for _, rd in ipairs(rolesDef) do
-    local sumIl = 0
-    for _, nm in ipairs(rd.list) do
-      sumIl = sumIl + (playerItemLevels[nm] or (MyRaidAddon.db.profile.invitedPlayers[nm] and MyRaidAddon.db.profile.invitedPlayers[nm].ilvl) or 0)
+  -- Dropdown version (smaller, inline) for quick role assignment
+  local function ShowAssignDropdown(anchorWidget, name)
+    local anchorFrame = anchorWidget and anchorWidget.frame or nil
+    MyRaidAddon:OpenAssignWindow(name, anchorFrame)
+  end
+
+  -- Einheitliche Tabelle für aktive Rollen (Tanks ? Heals ? Melee ? Range)
+  -- Build maps für Gruppenzugehörigkeit und Online-Status
+  local unitByNameAR, isOnlineAR = {}, {}
+  for unit in IterateGroup() do
+    local nm = GetUnitName(unit, true)
+    if nm then
+      nm = getFullPlayerName(nm)
+      unitByNameAR[nm] = unit
+      isOnlineAR[nm] = UnitIsConnected(unit) and true or false
     end
-    local box = AceGUI:Create("InlineGroup"); box:SetTitle(rd.label.." ("..sumIl..")"); box:SetLayout("Flow"); box:SetFullWidth(true); scroll:AddChild(box)
+  end
+  local function statusIconAR(name)
+    if unitByNameAR[name] then
+      if isOnlineAR[name] then
+        return "|TInterface\\FriendsFrame\\StatusIcon-Online:12:12|t"
+      else
+        return "|TInterface\\FriendsFrame\\StatusIcon-Offline:12:12|t"
+      end
+    else
+      return "|TInterface\\FriendsFrame\\StatusIcon-Away:12:12|t"
+    end
+  end
 
-    local head = AceGUI:Create("SimpleGroup"); head:SetFullWidth(true); head:SetLayout("Flow"); box:AddChild(head)
-    local function addH(t,w) local l=AceGUI:Create("Label"); l:SetText(t); if w then l:SetWidth(w) else l:SetRelativeWidth(0.33) end; head:AddChild(l) end
-    addH("Name",220); addH("ilvl",60); addH("Status",140)
+  local roleRows = {}
+  local function pushRows(list, roleKey)
+    for _, nm in ipairs(list) do
+      if nm:find("-") then table.insert(roleRows, {name=nm, role=roleKey}) end
+    end
+  end
+  pushRows(activeTank,   "tank")
+  pushRows(activeHealer, "healer")
+  pushRows(activeMelee,  "melee")
+  pushRows(activeRange,  "range")
 
-    for _, nm in ipairs(rd.list) do
-      if nm:find("-") then
-        local row = AceGUI:Create("SimpleGroup"); row:SetFullWidth(true); row:SetLayout("Flow"); box:AddChild(row)
-        local disp = "|c"..getClassColorCode(nm)..nm.."|r"
-        local il   = playerItemLevels[nm] or (MyRaidAddon.db.profile.invitedPlayers[nm] and MyRaidAddon.db.profile.invitedPlayers[nm].ilvl) or ""
-        local st   = (MyRaidAddon.db.profile.invitedPlayers[nm] and MyRaidAddon.db.profile.invitedPlayers[nm].status) or ""
+  local orderIdx = { tank=1, healer=2, melee=3, range=4 }
+  table.sort(roleRows, function(a,b)
+    local oa, ob = orderIdx[a.role] or 99, orderIdx[b.role] or 99
+    if oa ~= ob then return oa < ob end
+    return (a.name or "") < (b.name or "")
+  end)
 
-        local nameL = AceGUI:Create("InteractiveLabel"); nameL:SetText(disp); nameL:SetWidth(220)
-        nameL:SetCallback("OnClick", function() ShowPlayerOptions(nm) end); row:AddChild(nameL)
-        local ilL = AceGUI:Create("Label"); ilL:SetText(il); ilL:SetWidth(60); row:AddChild(ilL)
-        local stL = AceGUI:Create("Label"); stL:SetText(st); stL:SetWidth(140); row:AddChild(stL)
+  local activeBox = AceGUI:Create("InlineGroup"); activeBox:SetTitle("Active Roles"); activeBox:SetLayout("Flow"); activeBox:SetFullWidth(true); scroll:AddChild(activeBox)
+  local headAR = AceGUI:Create("SimpleGroup"); headAR:SetFullWidth(true); headAR:SetLayout("Flow"); activeBox:AddChild(headAR)
+  local function addH3(t, rel) local l=AceGUI:Create("Label"); l:SetText(t); l:SetRelativeWidth(rel); headAR:AddChild(l) end
+  addH3("Name", 0.36); addH3("ilvl", 0.12); addH3("Status", 0.20); addH3("Role", 0.20)
+
+  for _, row in ipairs(roleRows) do
+    local nm, roleKey = row.name, row.role
+    local disp = "|c"..getClassColorCode(nm)..nm.."|r"
+    local il   = playerItemLevels[nm] or (MyRaidAddon.db.profile.invitedPlayers[nm] and MyRaidAddon.db.profile.invitedPlayers[nm].ilvl) or ""
+    local st   = (MyRaidAddon.db.profile.invitedPlayers[nm] and MyRaidAddon.db.profile.invitedPlayers[nm].status) or ""
+
+    local rgrp = AceGUI:Create("SimpleGroup"); rgrp:SetFullWidth(true); rgrp:SetLayout("Flow"); activeBox:AddChild(rgrp)
+
+    local nameL = AceGUI:Create("InteractiveLabel"); nameL:SetText(disp); nameL:SetRelativeWidth(0.36)
+    nameL:SetCallback("OnClick", function(widget) MyRaidAddon:OpenAssignWindow(nm, widget and widget.frame) end); rgrp:AddChild(nameL)
+    local ilL = AceGUI:Create("Label"); ilL:SetText(il); ilL:SetRelativeWidth(0.12); rgrp:AddChild(ilL)
+    local stL = AceGUI:Create("Label"); stL:SetText(statusIconAR(nm).."  "..st); stL:SetRelativeWidth(0.20); rgrp:AddChild(stL)
+
+    local roleL = AceGUI:Create("InteractiveLabel")
+    local roleDisp = (roleKey=="tank" and "Tank") or (roleKey=="healer" and "Healer") or (roleKey=="melee" and "Melee DPS") or (roleKey=="range" and "Range DPS") or roleKey
+    roleL:SetText(roleDisp)
+    roleL:SetRelativeWidth(0.20)
+    roleL:SetCallback("OnClick", function(widget) MyRaidAddon:OpenAssignWindow(nm, widget and widget.frame) end)
+    rgrp:AddChild(roleL)
+  end
+
+  updatePlayersWithoutRole()
+
+  -- Build maps für Gruppenzugehörigkeit und Online-Status
+  local unitByName, isOnline = {}, {}
+  for unit in IterateGroup() do
+    local nm = GetUnitName(unit, true)
+    if nm then
+      nm = getFullPlayerName(nm)
+      unitByName[nm] = unit
+      isOnline[nm] = UnitIsConnected(unit) and true or false
+    end
+  end
+
+  local function statusIcon(name)
+    if unitByName[name] then
+      if isOnline[name] then
+        return "|TInterface\\FriendsFrame\\StatusIcon-Online:12:12|t"
+      else
+        return "|TInterface\\FriendsFrame\\StatusIcon-Offline:12:12|t"
+      end
+    else
+      return "|TInterface\\FriendsFrame\\StatusIcon-Away:12:12|t"
+    end
+  end
+
+  -- Filter anwenden und nach Gruppenstatus trennen
+  local showOnlyGroup  = (MyRaidAddon.db.profile.noRoleFilter and MyRaidAddon.db.profile.noRoleFilter.onlyGroup) or false
+  local showOnlyOnline = (MyRaidAddon.db.profile.noRoleFilter and MyRaidAddon.db.profile.noRoleFilter.onlyOnline) or false
+  local maxRows        = (MyRaidAddon.db.profile.noRoleFilter and MyRaidAddon.db.profile.noRoleFilter.maxRows) or 10
+  if maxRows < 1 then maxRows = 1 end
+
+  local listGroupOnline, listGroupOffline, listOthers = {}, {}, {}
+  for _, nm in ipairs(playersWithoutRole) do
+    if nm:find("-") and not inAnyActiveList(nm) then
+      local inGrp = unitByName[nm] ~= nil
+      local online = isOnline[nm] and true or false
+      if (not showOnlyGroup or inGrp) and (not showOnlyOnline or online) then
+        if inGrp and online then
+          table.insert(listGroupOnline, nm)
+        elseif inGrp and not online then
+          table.insert(listGroupOffline, nm)
+        else
+          table.insert(listOthers, nm)
+        end
       end
     end
   end
 
-  updatePlayersWithoutRole()
-  local others = AceGUI:Create("InlineGroup"); others:SetTitle("Without Role & Requests"); others:SetLayout("Flow"); others:SetFullWidth(true); scroll:AddChild(others)
-  local head = AceGUI:Create("SimpleGroup"); head:SetFullWidth(true); head:SetLayout("Flow"); others:AddChild(head)
-  local function addH2(t) local l=AceGUI:Create("Label"); l:SetText(t); l:SetRelativeWidth(0.33); head:AddChild(l) end
-  addH2("Name"); addH2("ilvl"); addH2("Status")
+  local function renderSection(parent, title, arr)
+    if #arr == 0 then return 0 end
+    local box = AceGUI:Create("InlineGroup"); box:SetTitle(title.." ("..tostring(#arr)..")"); box:SetLayout("Flow"); box:SetFullWidth(true); parent:AddChild(box)
+    local head = AceGUI:Create("SimpleGroup"); head:SetFullWidth(true); head:SetLayout("Flow"); box:AddChild(head)
+    local function addH2(t) local l=AceGUI:Create("Label"); l:SetText(t); l:SetRelativeWidth(0.33); head:AddChild(l) end
+    addH2("Name"); addH2("ilvl"); addH2("Status")
 
-  for _, nm in ipairs(playersWithoutRole) do
-    if nm:find("-") and not inAnyActiveList(nm) then
-      local row = AceGUI:Create("SimpleGroup"); row:SetFullWidth(true); row:SetLayout("Flow"); others:AddChild(row)
+    local rendered = 0
+    for i, nm in ipairs(arr) do
+      if rendered >= maxRows then break end
       local disp = "|c"..getClassColorCode(nm)..nm.."|r"
       local il   = playerItemLevels[nm] or (MyRaidAddon.db.profile.invitedPlayers[nm] and MyRaidAddon.db.profile.invitedPlayers[nm].ilvl) or ""
       local st   = (MyRaidAddon.db.profile.invitedPlayers[nm] and MyRaidAddon.db.profile.invitedPlayers[nm].status) or ""
 
+      local row = AceGUI:Create("SimpleGroup"); row:SetFullWidth(true); row:SetLayout("Flow"); box:AddChild(row)
+
       local nameL = AceGUI:Create("InteractiveLabel"); nameL:SetText(disp); nameL:SetRelativeWidth(0.33)
-      nameL:SetCallback("OnClick", function()
-        local frame = AceGUI:Create("Window")
-        frame:SetTitle("Assign Role"); frame:SetLayout("List"); frame:SetWidth(260); frame:SetHeight(330)
-        frame:SetCallback("OnClose", function(w) AceGUI:Release(w) end)
-        local roles = { {key="tank",label="Tank"},{key="healer",label="Healer"},{key="range",label="Range DPS"},{key="melee",label="Melee DPS"} }
-        for _,r in ipairs(roles) do
-          local b = AceGUI:Create("Button"); b:SetText(r.label); b:SetWidth(200)
-          b:SetCallback("OnClick", function()
-            assignRoleAndPersist(nm, r.key); frame:Hide()
-          end)
-          frame:AddChild(b)
+      nameL:SetCallback("OnClick", function(widget, _, button)
+        if IsShiftKeyDown() then
+          doWhoQuery(nm)
+        else
+          ShowAssignDropdown(widget, nm)
         end
       end)
       row:AddChild(nameL)
 
       local ilL = AceGUI:Create("Label"); ilL:SetText(il); ilL:SetRelativeWidth(0.33); row:AddChild(ilL)
-      local stL = AceGUI:Create("Label"); stL:SetText(st); stL:SetRelativeWidth(0.33); row:AddChild(stL)
+      local stL = AceGUI:Create("Label"); stL:SetText(statusIcon(nm).."  "..st); stL:SetRelativeWidth(0.33); row:AddChild(stL)
+      rendered = rendered + 1
     end
+    return rendered
+  end
+
+  -- Gesamtkontainer für No-Role Bereich
+  local others = AceGUI:Create("InlineGroup"); others:SetTitle("Without Role (filtered)"); others:SetLayout("Flow"); others:SetFullWidth(true); scroll:AddChild(others)
+
+  local totalRendered = 0
+  totalRendered = totalRendered + renderSection(others, "Group Online", listGroupOnline)
+  if totalRendered < maxRows then totalRendered = totalRendered + renderSection(others, "Group Offline", listGroupOffline) end
+  if totalRendered < maxRows then
+    local remaining = maxRows - totalRendered
+    -- Temporär reduziere maxRows für die letzte Sektion
+    local prevMax = maxRows; maxRows = remaining
+    totalRendered = totalRendered + renderSection(others, "Not In Group", listOthers)
+    maxRows = prevMax
   end
 end
 
@@ -1769,74 +2095,230 @@ end
 local function openAtCursor(win)
   if not win or not win.frame then return end
   local f = win.frame
+  -- Ensure the context window is always on top and clickable
+  if f.SetToplevel then f:SetToplevel(true) end
+  if f.SetFrameStrata then f:SetFrameStrata("TOOLTIP") end
+  if f.Raise then f:Raise() end
   f:ClearAllPoints()
   local x, y = GetCursorPosition()
   local scale = UIParent:GetEffectiveScale()
   f:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", x/scale, y/scale)
 end
 
+-- Global role assignment helper so UI code can call it anywhere
+function MyRaidAddon:AssignRoleAndPersist(name, roleKey)
+  if not name or not roleKey then return end
+  removeFromAllActiveLists(name)
+  if roleKey=="tank" then table.insert(activeTank, name)
+  elseif roleKey=="healer" then table.insert(activeHealer, name)
+  elseif roleKey=="range" then table.insert(activeRange, name)
+  elseif roleKey=="melee" then table.insert(activeMelee, name) end
+  InviteIfNotExcluded(name)
+  self:AddToInvitedPlayers(name, roleKey, isPlayerInGroup(name) and "active" or "invited")
+  PersistActiveRoles()
+  updatePlayersWithoutRole(); updatePlayerStatuses()
+  if self.UpdateRoleManagementPage then self:UpdateRoleManagementPage() end
+  if RebuildActiveTab then RebuildActiveTab() end
+end
+
+-- Lightweight dropdown helpers (Blizzard UIDropDown/EasyMenu)
+local function ensureDropdownFrame()
+  if not MyRaidAddon._dropdownFrame then
+    MyRaidAddon._dropdownFrame = CreateFrame("Frame", "LFMManagerContextMenu", UIParent, "UIDropDownMenuTemplate")
+    MyRaidAddon._dropdownFrame:HookScript("OnHide", function()
+      MyRaidAddon._easyMenuShown = false
+      MyRaidAddon._menuAnchorWidget = nil
+    end)
+  end
+  return MyRaidAddon._dropdownFrame
+end
+
+-- Simple fallback dropdown if EasyMenu is unavailable
+local function ensureMenuCatcher()
+  if not MyRaidAddon._menuCatcher then
+    local c = CreateFrame("Frame", "LFMManagerMenuCatcher", UIParent)
+    c:Hide()
+    c:SetAllPoints(UIParent)
+    c:EnableMouse(true)
+    c:SetFrameStrata("FULLSCREEN_DIALOG")
+    c:SetFrameLevel(100)
+    c:SetScript("OnMouseDown", function(self)
+      local m = MyRaidAddon._simpleMenu
+      if m then
+        -- If the click is inside the menu or any of its children, ignore
+        local focus = GetMouseFocus()
+        while focus do
+          if focus == m then return end
+          focus = focus:GetParent()
+        end
+        m:Hide()
+      end
+      self:Hide()
+    end)
+    MyRaidAddon._menuCatcher = c
+  end
+  return MyRaidAddon._menuCatcher
+end
+
+local function buildSimpleDropdown(menuList, anchorFrame)
+  local catcher = ensureMenuCatcher(); catcher:Show()
+  if MyRaidAddon._simpleMenu then MyRaidAddon._simpleMenu:Hide() end
+  -- Parent the menu to UIParent (not the catcher) so it stays above and clickable
+  local f = CreateFrame("Frame", nil, UIParent, BackdropTemplateMixin and "BackdropTemplate" or nil)
+  f:SetToplevel(true)
+  f:SetFrameStrata("TOOLTIP")
+  f:SetFrameLevel(10001)
+  f:EnableMouse(true)
+  f:SetBackdrop({ bgFile = "Interface/Tooltips/UI-Tooltip-Background", edgeFile = "Interface/Tooltips/UI-Tooltip-Border", tile = true, tileSize = 16, edgeSize = 16, insets = { left = 4, right = 4, top = 4, bottom = 4 } })
+  f:SetBackdropColor(0,0,0,0.9)
+  f:EnableKeyboard(true)
+  f:SetPropagateKeyboardInput(true)
+  f:SetScript("OnKeyDown", function(self, key)
+    if key == "ESCAPE" then self:Hide() end
+  end)
+
+  local items = {}
+  for _,it in ipairs(menuList or {}) do
+    if it.isTitle then
+      table.insert(items, { text = it.text or "", isTitle = true })
+    elseif it.hasArrow and type(it.menuList)=="table" then
+      if it.text and it.text ~= "" then table.insert(items, { text = it.text, isTitle = true }) end
+      for _,sub in ipairs(it.menuList) do
+        table.insert(items, { text = sub.text, func = sub.func })
+      end
+    else
+      table.insert(items, { text = it.text, func = it.func })
+    end
+  end
+
+  local padding, rowH, width = 6, 18, 170
+  local y = -padding
+  f:SetScale(0.95)
+  -- Title bar with close button (small X)
+  if #items > 0 and items[1].isTitle then
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    title:SetPoint("TOPLEFT", f, "TOPLEFT", padding+2, y)
+    title:SetText(items[1].text or "")
+    local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+    close:SetSize(14,14)
+    close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -4)
+    close:SetFrameLevel(f:GetFrameLevel()+15)
+    close:SetScript("OnClick", function() f:Hide(); catcher:Hide() end)
+    y = y - rowH
+  end
+  for _,it in ipairs(items) do
+    if not it.isTitle then
+      local text = it.text or ""
+      local action = it.func
+      local btn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+      btn:SetPoint("TOPLEFT", f, "TOPLEFT", padding, y)
+      btn:SetSize(width - padding*2, rowH)
+      btn:SetText(text)
+      btn:RegisterForClicks("AnyUp")
+      btn:SetFrameStrata("TOOLTIP")
+      btn:SetFrameLevel(f:GetFrameLevel() + 10)
+      btn:EnableMouse(true)
+      btn:SetHitRectInsets(-2,-2,-2,-2)
+      btn:SetScript("OnClick", function()
+        if type(action)=="function" then action() end
+        f:Hide(); catcher:Hide()
+      end)
+      y = y - (rowH + 2)
+    end
+  end
+
+  local totalH = -y + padding
+  f:SetSize(width, totalH)
+  if anchorFrame and anchorFrame.GetCenter then
+    f:ClearAllPoints(); f:SetPoint("TOPLEFT", anchorFrame, "BOTTOMLEFT", 0, -2)
+  else
+    local x, ycur = GetCursorPosition(); local scale = UIParent:GetEffectiveScale()
+    f:ClearAllPoints(); f:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", x/scale, ycur/scale)
+  end
+  f:SetScript("OnHide", function()
+    catcher:Hide()
+    if MyRaidAddon._simpleMenu == f then MyRaidAddon._simpleMenu = nil end
+  end)
+  f:Show()
+  MyRaidAddon._simpleMenu = f
+end
+
+function openDropdownAt(anchorFrame, menuList)
+  -- Toggle behavior: click again on same anchor closes the menu
+  if MyRaidAddon._menuAnchorWidget and MyRaidAddon._menuAnchorWidget == anchorFrame then
+    if MyRaidAddon._simpleMenu and MyRaidAddon._simpleMenu:IsShown() then
+      MyRaidAddon._simpleMenu:Hide(); MyRaidAddon._menuAnchorWidget = nil; MyRaidAddon._easyMenuShown = false; return
+    end
+    if MyRaidAddon._easyMenuShown and CloseDropDownMenus then
+      CloseDropDownMenus(); MyRaidAddon._menuAnchorWidget = nil; MyRaidAddon._easyMenuShown = false; return
+    end
+  end
+
+  -- Close any existing before opening a new one
+  if MyRaidAddon._simpleMenu and MyRaidAddon._simpleMenu:IsShown() then MyRaidAddon._simpleMenu:Hide() end
+  if MyRaidAddon._easyMenuShown and CloseDropDownMenus then CloseDropDownMenus() end
+
+  if type(EasyMenu) == "function" then
+    local dd = ensureDropdownFrame()
+    if not anchorFrame or not anchorFrame.GetCenter then
+      EasyMenu(menuList, dd, "cursor", 0, 0, "MENU", true)
+    else
+      EasyMenu(menuList, dd, anchorFrame, 0, 0, "MENU", true)
+    end
+    MyRaidAddon._easyMenuShown = true
+    MyRaidAddon._menuAnchorWidget = anchorFrame
+  else
+    MyRaidAddon._menuAnchorWidget = anchorFrame
+    buildSimpleDropdown(menuList, anchorFrame)
+  end
+end
+
+-- Close any open context menus (called on tab switch, etc.)
+local function CloseContextMenus()
+  if MyRaidAddon._simpleMenu and MyRaidAddon._simpleMenu:IsShown() then MyRaidAddon._simpleMenu:Hide() end
+  if MyRaidAddon._easyMenuShown and CloseDropDownMenus then CloseDropDownMenus() end
+  MyRaidAddon._menuAnchorWidget = nil
+  MyRaidAddon._easyMenuShown = false
+end
+
 -- ==============================
 -- History Context Menu (at cursor)
 -- ==============================
-local function showHistoryContext(name)
+local function showHistoryContext(name, anchorWidget)
   local store = ensureWhisperStore()
   local data  = MyRaidAddon.db.profile.invitedPlayers[name] or {}
-
-  local frame = AceGUI:Create("Window")
-  frame:SetTitle("Options: "..name)
-  frame:SetLayout("List")
-  frame:SetWidth(220); frame:SetHeight(360)
-  frame:SetCallback("OnClose", function(w) AceGUI:Release(w) end)
-
-  local function addAction(label, fn)
-    local b = AceGUI:Create("Button"); b:SetText(label); b:SetWidth(180)
-    b:SetCallback("OnClick", function() fn(); frame:Hide(); RebuildActiveTab() end)
-    frame:AddChild(b)
+  local function assignRoleDirect(roleKey)
+    removeFromAllActiveLists(name)
+    if roleKey=="tank" then table.insert(activeTank, name)
+    elseif roleKey=="healer" then table.insert(activeHealer, name)
+    elseif roleKey=="range" then table.insert(activeRange, name)
+    elseif roleKey=="melee" then table.insert(activeMelee, name) end
+    InviteIfNotExcluded(name)
+    MyRaidAddon:AddToInvitedPlayers(name, roleKey, isPlayerInGroup(name) and "active" or "invited")
+    PersistActiveRoles()
+    updatePlayersWithoutRole(); updatePlayerStatuses(); if RebuildActiveTab then RebuildActiveTab() end
   end
 
-  addAction("Invite", function()
-    InviteIfNotExcluded(name)
-    MyRaidAddon:AddToInvitedPlayers(name, data.lastRole, "invited")
-    updatePlayerStatuses()
-  end)
+  local menu = {
+    { text = name, isTitle = true, notCheckable = true },
+    { text = "Assign Role...", notCheckable = true, func = function() MyRaidAddon:OpenAssignWindow(name, anchorWidget and anchorWidget.frame) end },
 
-  addAction("Remove from Group", function()
-    if UninviteUnit then UninviteUnit(name) end
-    updatePlayerStatuses()
-  end)
 
-  addAction("Exclude Player", function()
-    MyRaidAddon.db.profile.invitedPlayers[name] = MyRaidAddon.db.profile.invitedPlayers[name] or {}
-    MyRaidAddon.db.profile.invitedPlayers[name].status = "Excluded"
-    removeFromAllActiveLists(name)
-    updatePlayersWithoutRole(); updatePlayerStatuses()
-  end)
 
-  addAction("Refresh ilvl", function()
-    local unitMatch
-    for unit in IterateGroup() do
-      local unitName = GetUnitName(unit, true)
-      if unitName and getFullPlayerName(unitName) == name then unitMatch = unit; break end
-    end
-    if unitMatch then
-      queueInspect(unitMatch)
-      print("|cff33ff99[LFM]|r Inspect queued for "..name)
-    else
-      print("|cffffaa00[LFM]|r "..name.." is not currently in your group for inspection.")
-    end
-  end)
 
-  addAction("Open Whisper Log", function() showWhisperDetail(name) end)
 
-  addAction("Clear Chat Log", function() if store[name] then store[name] = {} end end)
-
-  addAction("Remove from DB", function()
-    MyRaidAddon.db.profile.invitedPlayers[name] = nil
-    removeFromAllActiveLists(name)
-    updatePlayersWithoutRole(); updatePlayerStatuses()
-  end)
-
-  openAtCursor(frame)
+    { text = "/who Player", notCheckable = true, func = function() doWhoQuery(name) end },
+    { text = "Whisper",      notCheckable = true, func = function() if ChatFrame_OpenChat then ChatFrame_OpenChat("/w "..name.." ") end end },
+    { text = "Invite",       notCheckable = true, func = function() InviteIfNotExcluded(name); MyRaidAddon:AddToInvitedPlayers(name, data.lastRole, "invited"); updatePlayerStatuses(); if RebuildActiveTab then RebuildActiveTab() end end },
+    { text = "Remove from Group", notCheckable = true, func = function() if UninviteUnit then UninviteUnit(name) end; updatePlayerStatuses(); if RebuildActiveTab then RebuildActiveTab() end end },
+    { text = "Exclude Player",    notCheckable = true, func = function() MyRaidAddon.db.profile.invitedPlayers[name] = MyRaidAddon.db.profile.invitedPlayers[name] or {}; MyRaidAddon.db.profile.invitedPlayers[name].status = "Excluded"; removeFromAllActiveLists(name); updatePlayersWithoutRole(); updatePlayerStatuses(); if RebuildActiveTab then RebuildActiveTab() end end },
+    { text = "Refresh ilvl",      notCheckable = true, func = function() local unitMatch; for unit in IterateGroup() do local unitName = GetUnitName(unit, true); if unitName and getFullPlayerName(unitName) == name then unitMatch = unit; break end end; if unitMatch then queueInspect(unitMatch); print("|cff33ff99[LFM]|r Inspect queued for "..name) else print("|cffffaa00[LFM]|r "..name.." is not currently in your group for inspection.") end end },
+    { text = "Open Whisper Log", notCheckable = true, func = function() showWhisperDetail(name) end },
+    { text = "Clear Chat Log",  notCheckable = true, func = function() if store[name] then store[name] = {} end; if RebuildActiveTab then RebuildActiveTab() end end },
+    { text = "Remove from DB",  notCheckable = true, func = function() MyRaidAddon.db.profile.invitedPlayers[name] = nil; removeFromAllActiveLists(name); updatePlayersWithoutRole(); updatePlayerStatuses(); if RebuildActiveTab then RebuildActiveTab() end end },
+  }
+  local anchor = anchorWidget and anchorWidget.frame or nil
+  openDropdownAt(anchor, menu)
 end
 
 -- ==============================
@@ -1844,44 +2326,151 @@ end
 -- ==============================
 local function buildHistoryTab(container)
   container:ReleaseChildren()
-  local scroll = AceGUI:Create("ScrollFrame"); scroll:SetLayout("Flow"); scroll:SetFullWidth(true); scroll:SetFullHeight(true); container:AddChild(scroll)
+  local root = AceGUI:Create("SimpleGroup"); root:SetLayout("Flow"); root:SetFullWidth(true); root:SetFullHeight(true); container:AddChild(root)
+
+  -- Top: scrollable table (height adjusted responsively)
+  local scroll = AceGUI:Create("ScrollFrame"); scroll:SetLayout("Flow"); scroll:SetFullWidth(true); scroll:SetHeight(420); root:AddChild(scroll)
 
   local db = MyRaidAddon.db.profile.invitedPlayers
   local store = ensureWhisperStore()
 
   local header = AceGUI:Create("SimpleGroup"); header:SetFullWidth(true); header:SetLayout("Flow"); scroll:AddChild(header)
-  local function H(t,rel) local l=AceGUI:Create("Label"); l:SetText(t); l:SetRelativeWidth(rel); header:AddChild(l) end
-  H("Name",0.28); H("Last Role",0.1); H("ilvl",0.08); H("Status",0.18); H("#Msgs",0.08); H("Last Whisper",0.20); H(" ",0.08)
+  -- Sorting state defaults
+  MyRaidAddon.db.profile.historySortKey = MyRaidAddon.db.profile.historySortKey or "last"
+  if MyRaidAddon.db.profile.historySortAsc == nil then MyRaidAddon.db.profile.historySortAsc = false end
+  local curKey  = MyRaidAddon.db.profile.historySortKey
+  local curAsc  = MyRaidAddon.db.profile.historySortAsc and true or false
+  local function addHeader(label, rel, key)
+    local txt = label
+    if key and key == curKey then txt = label .. (curAsc and " ?" or " ?") end
+    local w = AceGUI:Create("InteractiveLabel"); w:SetText(txt); w:SetRelativeWidth(rel)
+    if key then
+      w:SetCallback("OnClick", function()
+        if MyRaidAddon.db.profile.historySortKey == key then
+          MyRaidAddon.db.profile.historySortAsc = not MyRaidAddon.db.profile.historySortAsc
+        else
+          MyRaidAddon.db.profile.historySortKey = key
+          -- Default for new key: by last date desc, others asc
+          MyRaidAddon.db.profile.historySortAsc = (key ~= "last")
+        end
+        RebuildActiveTab()
+      end)
+    end
+    header:AddChild(w)
+  end
+  addHeader("Name", 0.28, "name")
+  addHeader("Last Role", 0.1, "role")
+  addHeader("ilvl", 0.08, "ilvl")
+  addHeader("Status", 0.18, "status")
+  addHeader("#Msgs", 0.08, "msgs")
+  addHeader("Last Whisper", 0.20, "last")
+  addHeader(" ", 0.08, nil)
 
+  -- Bottom: persistent, read-only whisper viewer (scrollable list)
+  local viewBox = AceGUI:Create("InlineGroup"); viewBox:SetTitle("Whisper Text"); viewBox:SetFullWidth(true); viewBox:SetHeight(130); viewBox:SetLayout("Fill"); root:AddChild(viewBox)
+  local viewScroll = AceGUI:Create("ScrollFrame"); viewScroll:SetLayout("List"); viewBox:AddChild(viewScroll)
+
+  local function updateViewer(name)
+    local msgs = store[name] or {}
+    viewBox:SetTitle("Whisper Text: "..name)
+    viewScroll:ReleaseChildren()
+    if #msgs == 0 then
+      local none = AceGUI:Create("Label"); none:SetText("(no messages)"); none:SetFullWidth(true); viewScroll:AddChild(none)
+      return
+    end
+    for i=1,#msgs do
+      local m = msgs[i]
+      local ts = date("%Y-%m-%d %H:%M:%S", m.time or GetServerTime())
+      local arrow = (m.dir=="in" and ">>") or (m.dir=="out" and "<<") or "--"
+      local line = AceGUI:Create("Label")
+      line:SetText(string.format("[%s] %s %s", ts, arrow, m.text or ""))
+      line:SetFullWidth(true)
+      viewScroll:AddChild(line)
+    end
+  end
+
+  -- Keep references for responsive resize adjustments
+  MyRaidAddon._historyScroll = scroll
+  MyRaidAddon._historyViewBox = viewBox
+  if MyRaidAddon.AdjustHistoryHeights then MyRaidAddon:AdjustHistoryHeights() end
+
+  -- Build sortable entries list
   local keysMap = {}
   for k,_ in pairs(db) do keysMap[k]=true end
   for k,_ in pairs(store) do keysMap[k]=true end
-  local keys = {}; for k,_ in pairs(keysMap) do table.insert(keys, k) end
-  table.sort(keys)
+  local entries = {}
+  for name,_ in pairs(keysMap) do
+    local data = db[name] or {}
+    local msgs = store[name] or {}
+    local lastTsNum = 0
+    if #msgs > 0 and msgs[#msgs].time then lastTsNum = msgs[#msgs].time end
+    table.insert(entries, {
+      name = name,
+      role = data.lastRole or "",
+      ilvl = tonumber(data.ilvl) or 0,
+      status = data.status or "",
+      msgs = #msgs,
+      last = lastTsNum,
+    })
+  end
+  local key = MyRaidAddon.db.profile.historySortKey or "last"
+  local asc = MyRaidAddon.db.profile.historySortAsc and true or false
+  table.sort(entries, function(a,b)
+    local va, vb
+    if key == "name" then va, vb = a.name, b.name
+    elseif key == "role" then va, vb = a.role, b.role
+    elseif key == "ilvl" then va, vb = a.ilvl, b.ilvl
+    elseif key == "status" then va, vb = a.status, b.status
+    elseif key == "msgs" then va, vb = a.msgs, b.msgs
+    else va, vb = a.last, b.last end
+    if va == vb then return a.name < b.name end
+    if asc then return va < vb else return va > vb end
+  end)
 
-  if #keys==0 then
+  if #entries==0 then
     local none = AceGUI:Create("Label"); none:SetText("No history yet."); none:SetFullWidth(true); scroll:AddChild(none)
     return
   end
 
-  for _, name in ipairs(keys) do
+  for _, e in ipairs(entries) do
+    local name = e.name
     local data = db[name] or {}
     local msgs = store[name] or {}
-    local lastTs = (#msgs>0 and msgs[#msgs].time) and date("%Y-%m-%d %H:%M:%S", msgs[#msgs].time) or "-"
+    local lastTs = (e.last and e.last>0) and date("%Y-%m-%d %H:%M:%S", e.last) or "-"
 
     local row = AceGUI:Create("SimpleGroup"); row:SetFullWidth(true); row:SetLayout("Flow"); scroll:AddChild(row)
     local display = "|c"..getClassColorCode(name)..name.."|r"
 
     local nL = AceGUI:Create("InteractiveLabel"); nL:SetText(display); nL:SetRelativeWidth(0.28)
-    nL:SetCallback("OnClick", function() showWhisperDetail(name) end); row:AddChild(nL)
+    nL:SetCallback("OnClick", function(widget, _, button)
+      if button=="RightButton" then
+        showHistoryContext(name, widget)
+      elseif IsShiftKeyDown() then
+        doWhoQuery(name)
+      else
+        updateViewer(name)
+      end
+    end); row:AddChild(nL)
     local rL = AceGUI:Create("Label"); rL:SetText(data.lastRole or ""); rL:SetRelativeWidth(0.1); row:AddChild(rL)
     local iL = AceGUI:Create("Label"); iL:SetText(data.ilvl or "");    iL:SetRelativeWidth(0.08); row:AddChild(iL)
     local sL = AceGUI:Create("Label"); sL:SetText(data.status or "");  sL:SetRelativeWidth(0.18); row:AddChild(sL)
     local cL = AceGUI:Create("Label"); cL:SetText(tostring(#msgs));    cL:SetRelativeWidth(0.08); row:AddChild(cL)
     local tL = AceGUI:Create("Label"); tL:SetText(lastTs);             tL:SetRelativeWidth(0.20); row:AddChild(tL)
 
-    local opt = AceGUI:Create("Button"); opt:SetText("..."); opt:SetRelativeWidth(0.08)
-    opt:SetCallback("OnClick", function() showHistoryContext(name) end)
+    -- smaller, stable options control on the right
+    local opt = AceGUI:Create("InteractiveLabel")
+    opt:SetText("|cffbbbbbb...|r")
+    opt:SetRelativeWidth(0.06)
+    if opt.SetJustifyH then opt:SetJustifyH("RIGHT") end
+    opt:SetCallback("OnClick", function(widget) showHistoryContext(name, widget) end)
+    opt:SetCallback("OnEnter", function(widget)
+      GameTooltip:SetOwner(widget.frame, "ANCHOR_RIGHT")
+      GameTooltip:SetText("Options", 1,1,1)
+      GameTooltip:Show()
+    end)
+    opt:SetCallback("OnLeave", function()
+      GameTooltip:Hide()
+    end)
     row:AddChild(opt)
   end
 end
@@ -1942,7 +2531,13 @@ local function buildExcludedTab(container)
     local row = AceGUI:Create("SimpleGroup"); row:SetFullWidth(true); row:SetLayout("Flow"); scroll:AddChild(row)
     local display = "|c"..getClassColorCode(name)..name.."|r"
     local nL = AceGUI:Create("InteractiveLabel"); nL:SetText(display); nL:SetRelativeWidth(0.4); row:AddChild(nL)
-    nL:SetCallback("OnClick", function() showExcludedOptions(name) end)
+    nL:SetCallback("OnClick", function(_, _, button)
+      if IsShiftKeyDown() then
+        doWhoQuery(name)
+      else
+        showExcludedOptions(name)
+      end
+    end)
     local rL = AceGUI:Create("Label"); rL:SetText(data.lastRole or ""); rL:SetRelativeWidth(0.2); row:AddChild(rL)
     local iL = AceGUI:Create("Label"); iL:SetText(data.ilvl or "");    iL:SetRelativeWidth(0.15);  row:AddChild(iL)
     local sL = AceGUI:Create("Label"); sL:SetText("Excluded");         sL:SetRelativeWidth(0.15);  row:AddChild(sL)
@@ -2089,6 +2684,7 @@ local tabs = {
 }
 
 local function SelectTab(container, _, group)
+  if CloseContextMenus then CloseContextMenus() end
   container:ReleaseChildren()
   if     group=="main"     then buildMainTab(container)
   elseif group=="roles"    then buildRolesTab(container)
@@ -2097,6 +2693,21 @@ local function SelectTab(container, _, group)
   elseif group=="rules"    then buildRulesTab(container)
   elseif group=="sortrules"then buildSortRulesTab(container)
   else buildMainTab(container) end
+end
+
+-- Adjust the split between the history table (top) and the whisper viewer (bottom)
+function MyRaidAddon:AdjustHistoryHeights()
+  if not tabGroup or not tabGroup.GetSelected or tabGroup:GetSelected() ~= "history" then return end
+  local scroll = self._historyScroll
+  local view   = self._historyViewBox
+  if not scroll or not view then return end
+  local parentH = (tabGroup and tabGroup.frame and tabGroup.frame:GetHeight()) or (mainFrame and mainFrame.frame and mainFrame.frame:GetHeight()) or 700
+  local topH = math.floor(parentH * 0.58)
+  local botH = math.floor(parentH * 0.26)
+  if topH < 160 then topH = 160 end
+  if botH < 100 then botH = 100 end
+  scroll:SetHeight(topH)
+  view:SetHeight(botH)
 end
 
 function MyRaidAddon:CreateMainWindow()
@@ -2109,8 +2720,18 @@ function MyRaidAddon:CreateMainWindow()
     mainFrame:SetHeight(700)
     mainFrame:SetLayout("Fill")
     mainFrame:SetCallback("OnClose", function(widget)
+      if uiStatusTickerTimer then MyRaidAddon:CancelTimer(uiStatusTickerTimer, true); uiStatusTickerTimer = nil end
       AceGUI:Release(widget); mainFrame = nil; tabGroup = nil
     end)
+    -- Hook window resize to keep history pane responsive
+    local f = mainFrame.frame
+    if f and f.GetScript then
+      local prev = f:GetScript("OnSizeChanged")
+      f:SetScript("OnSizeChanged", function(frame, ...)
+        if type(prev) == "function" then prev(frame, ...) end
+        if MyRaidAddon and MyRaidAddon.AdjustHistoryHeights then MyRaidAddon:AdjustHistoryHeights() end
+      end)
+    end
   end
   mainFrame:Show()
   mainFrame:ReleaseChildren()
@@ -2124,15 +2745,84 @@ function MyRaidAddon:CreateMainWindow()
   mainFrame:AddChild(tabGroup)
 
   tabGroup:SelectTab("main")
+
+  -- 1-second status updater (progress + auto post countdown)
+  if uiStatusTickerTimer then MyRaidAddon:CancelTimer(uiStatusTickerTimer, true); uiStatusTickerTimer = nil end
+  if MyRaidAddon and MyRaidAddon.UpdateStatusBar then
+    MyRaidAddon:UpdateStatusBar()
+    uiStatusTickerTimer = MyRaidAddon:ScheduleRepeatingTimer(function() MyRaidAddon:UpdateStatusBar() end, 1.0)
+  end
 end
 
 -- ==============================
 -- Events (roster & inspect pump)
 -- ==============================
 local function onRosterUpdate()
+  -- Baue Lookup für aktuelle Gruppenzugehörigkeit und Online-Status
+  local unitByName, isOnline = {}, {}
+  for unit in IterateGroup() do
+    local nm = GetUnitName(unit, true)
+    if nm then
+      nm = getFullPlayerName(nm)
+      unitByName[nm] = unit
+      isOnline[nm] = UnitIsConnected(unit) and true or false
+    end
+  end
+
+  -- 1) Spieler aus aktiven Rollen entfernen, wenn offline oder nicht (mehr) in der Gruppe
+  local currentlyActive = {}
+  for _,n in ipairs(activeTank)   do currentlyActive[n] = true end
+  for _,n in ipairs(activeHealer) do currentlyActive[n] = true end
+  for _,n in ipairs(activeRange)  do currentlyActive[n] = true end
+  for _,n in ipairs(activeMelee)  do currentlyActive[n] = true end
+
+  for name,_ in pairs(currentlyActive) do
+    local unit = unitByName[name]
+    local online = unit and isOnline[name]
+    if (not unit) or (online == false) then
+      removeFromActiveListsKeepAssignment(name)
+      -- Status setzen: offline falls in Gruppe aber offline, sonst eingeladen
+      if unit and online == false then
+        MyRaidAddon:AddToInvitedPlayers(name, nil, "offline")
+      else
+        MyRaidAddon:AddToInvitedPlayers(name, nil, "invited")
+      end
+    end
+  end
+
+  -- 2) Zurück in aktive Rollen nehmen, wenn (wieder) in Gruppe und online, basierend auf gespeicherter Rolle
+  local ra = MyRaidAddon.db.profile.roleAssignments or {}
+  for name, unit in pairs(unitByName) do
+    if isOnline[name] and not inAnyActiveList(name) then
+      local role = ra[name]
+      if role and canAddToRole(role) then
+        PersistAddToActive(role, name)
+        MyRaidAddon:AddToInvitedPlayers(name, role, "active")
+      end
+    end
+  end
+
+  -- 3) Nacharbeiten: Status, Listen und UI
   updatePlayersWithoutRole()
   updatePlayerStatuses()
   for unit in IterateGroup() do queueInspect(unit) end
+  -- Gruppe automatisch in Raid/Party konvertieren je nach Größe
+  local num = (GetNumGroupMembers and GetNumGroupMembers()) or 0
+  local inRaid = IsInRaid and IsInRaid() or false
+  local function isLeader()
+    if UnitIsGroupLeader and UnitIsGroupLeader("player") then return true end
+    if IsPartyLeader and IsPartyLeader() then return true end
+    if IsRaidLeader and IsRaidLeader() then return true end
+    if (IsInGroup and not IsInGroup()) or (not GetNumGroupMembers or num==0) then return true end
+    return false
+  end
+  if not inRaid and num > 5 and ConvertToRaid and isLeader() then
+    ConvertToRaid()
+    print("|cff55ff55[LFM]|r Auto-converted to Raid (group size > 5)")
+  elseif inRaid and num <= 5 and ConvertToParty and isLeader() then
+    ConvertToParty()
+    print("|cff55ff55[LFM]|r Auto-converted to Party (group size <= 5)")
+  end
   if tabGroup and tabGroup.GetSelected then
     local sel = tabGroup:GetSelected()
     if sel=="roles" or sel=="history" or sel=="excluded" then RebuildActiveTab() end
@@ -2147,6 +2837,8 @@ function MyRaidAddon:OnInitialize()
   self.db = AceDB:New("MyRaidAddonDB", {
     profile = {
       autoReplyInviteEnabled = false,
+      lfmAutoPostEnabled = false,
+      lfmAutoPostInterval = 120,
       raidConfig        = raidConfig,
       selectedChannels  = {},
       invitedPlayers    = {},
@@ -2157,6 +2849,11 @@ function MyRaidAddon:OnInitialize()
       sortRulesText     = DEFAULT_SORT_TEXT,
       activeRoles       = { tank={}, healer={}, range={}, melee={} },
       roleAssignments   = {},
+      historySortKey    = "last",
+      historySortAsc    = false,
+      srLink            = "",
+      discordLink       = "",
+      raidWarnEnabled   = false,
     },
   }, true)
 
@@ -2166,6 +2863,8 @@ function MyRaidAddon:OnInitialize()
   self.db.profile.selectedChannels = self.db.profile.selectedChannels or {}
   self.db.profile.activeRoles      = self.db.profile.activeRoles      or { tank={}, healer={}, range={}, melee={} }
   self.db.profile.roleAssignments  = self.db.profile.roleAssignments  or {}
+  if type(self.db.profile.lfmAutoPostEnabled) ~= "boolean" then self.db.profile.lfmAutoPostEnabled = false end
+  if type(self.db.profile.lfmAutoPostInterval) ~= "number" then self.db.profile.lfmAutoPostInterval = 120 end
 
   autoReplyInviteEnabled = self.db.profile.autoReplyInviteEnabled or false
   selectedRaid      = self.db.profile.selectedRaid or selectedRaid
@@ -2198,9 +2897,13 @@ function MyRaidAddon:OnInitialize()
   self:RegisterEvent("GROUP_ROSTER_UPDATE", onRosterUpdate)
   self:RegisterEvent("PLAYER_ENTERING_WORLD", onRosterUpdate)
   self:RegisterEvent("INSPECT_READY", onInspectReady)
+  -- Reagiere auch auf Online/Offline Wechsel von Gruppeneinheiten
+  self:RegisterEvent("UNIT_CONNECTION", function() onRosterUpdate() end)
 
   -- Inspect Pumpe
   self:ScheduleRepeatingTimer(function() pumpInspect() end, 0.8)
+
+  -- Auto-Post LFM removed (no scheduled posting)
 
   -- Minimap Button (optional)
   local okLDB, LDBObj = pcall(LibStub, "LibDataBroker-1.1")
@@ -2225,3 +2928,14 @@ function MyRaidAddon:UpdateRoleManagementPage()
     RebuildActiveTab()
   end
 end
+
+
+
+
+
+
+
+
+
+
+
