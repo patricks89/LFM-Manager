@@ -15,6 +15,8 @@ local MyRaidAddon = LibStub("AceAddon-3.0"):NewAddon(
 local AceGUI   = LibStub("AceGUI-3.0")
 local AceDB    = LibStub("AceDB-3.0")
 
+local refreshGroupHistoryView
+
 -- defensive stub
 function MyRaidAddon:UpdateRoleManagementPage() end
 
@@ -158,6 +160,7 @@ end
 -- Whisper-Historie
 local WHISPER_MAX_KEEP = 200
 local WHISPER_SHOW     = 20
+local GROUP_HISTORY_MAX = 30
 
 -- Whisper Rules — Default Text (supports "||" variants)
 local DEFAULT_AI_TEXT = [[
@@ -382,7 +385,7 @@ stop=true
 -- ==============================
 -- NEW: Sort Rules (text-driven)
 -- ==============================
-local DEFAULT_SORT_TEXT = [[
+local LEGACY_SORT_TEXT_V1 = [[
 # ==================================
 # SORT RULES+ MANUAL / REFERENCE
 # ==================================
@@ -542,6 +545,152 @@ avoid=Melee>0
 prefer=Priest,Shaman,Druid,Warlock,Mage
 ]]
 
+local SORT_TEMPLATE_10 = [[
+# ==================================
+# 10-Man Template (2 groups)
+# ==================================
+Global=HealerInMelee<=1
+
+Grp=1
+wants=Tank,Melee,Healer
+require=Tank=1, Healer>=1
+avoid=Range>1
+prefer=Warrior,Paladin,Druid,Shaman,Rogue
+fill=Melee,Healer
+
+Grp=2
+wants=Range,Healer
+require=Healer>=1
+avoid=Melee>2
+prefer=Priest,Mage,Warlock,Hunter,Druid,Shaman
+fill=Range,Healer
+]]
+
+local SORT_TEMPLATE_20 = [[
+# ==================================
+# 20-Man Template (4 groups)
+# ==================================
+Global=HealerInMelee<=1; ShamanPerMeleeGrp>=1
+
+Grp=1
+wants=Melee
+require=Tank=1, Healer>=1, Shaman>=1
+avoid=Range>1
+prefer=Warrior,Rogue,Druid,Shaman
+fill=Tank,Melee
+
+Grp=2
+wants=Melee
+require=Tank=1, Shaman>=1
+avoid=Healer>1, Range>1
+prefer=Warrior,Rogue,Druid,Shaman
+fill=Melee
+
+Grp=3
+wants=Range
+require=Healer>=1, Shaman>=1
+avoid=Melee>0
+prefer=Warlock,Mage,Priest,Druid
+fill=Healer,Range
+
+Grp=4
+wants=Range,Healer
+require=Healer>=1
+avoid=Melee>1
+prefer=Priest,Druid,Shaman,Hunter,Mage
+fill=Healer,Range
+]]
+
+local SORT_RULES_TEMPLATE_VERSION = 2
+
+local SORT_TEMPLATE_40 = [[
+# ==================================
+# Adaptive Sort Rules Template
+# ==================================
+# Handbook
+# 1) Every section begins with Grp=# (1-8). Optional GrpType=Raid/Melee/Range/Healer labels are informational.
+# 2) Available keys inside a group:
+#    wants=Tank,Melee,Range,Healer         -> desired role mix (used when auto-filling empty slots)
+#    require=Role>=N,Class>=N,Spec>=N      -> minimum quotas; operators: =, !=, <, <=, >, >=
+#    avoid=Role> N, Class> N               -> maximum quotas using the same operators
+#    prefer=Warrior,Rogue,Druid            -> priority order when multiple candidates fit (first = highest priority)
+#    fill=Tank,Melee                       -> roles the filler step uses once core requirements are satisfied
+#    definition=legacy,syntax              -> legacy comma syntax is still parsed; prefer the keys above
+# 3) Role keywords: Tank, Healer, Melee, Range. Class keywords: Warrior, Priest, etc. Use Class(Spec) for spec locks (e.g. Priest(Shadow)).
+# 4) Slots are evaluated in the order defined; use wants/require/avoid together for fine-grained control.
+# 5) Optional global constraints can be declared anywhere using:
+#    Global=HealerInMelee<=1        -- limit healers per melee group
+#    Global=ShamanPerMeleeGrp>=1    -- ensure at least one Shaman in melee groups
+#    (add more constraints separated by semicolons)
+# 6) Lines starting with # are comments and ignored. Keep blank lines for readability.
+# 7) Leave the template as-is to use the built-in dynamic layout. Modify or append groups to customise your raid map.
+#
+# Auto layout overview (used when you keep the defaults):
+#   10 players -> 2 groups (tank core + caster support)
+#   20 players -> 4 groups (two tank cores, melee pod, caster pod)
+#   30 players -> 6 groups (two tank cores, two melee pods, two caster/healer pods)
+#   40 players -> 8 groups (full raid layout)
+#
+# ---------- Reference layout (mirrors the 40-player preset) ----------
+Grp=1
+wants=Melee
+require Tank=1, Shaman>=1
+avoid=Healer>1, Range>1
+prefer=Warrior,Rogue,Druid,Hunter
+fill=Tank,Melee
+
+Grp=2
+wants=Melee
+require Tank=1, Shaman>=1
+avoid=Healer>1, Range>1
+prefer=Warrior,Rogue,Druid,Hunter
+fill=Tank,Melee
+
+Grp=3
+wants=Melee
+require Shaman>=1
+avoid=Healer>=1, Range>0
+prefer=Warrior,Rogue,Druid,Shaman
+fill=Melee
+
+Grp=4
+wants=Melee
+require Shaman>=1
+avoid=Healer>=1, Range>0
+prefer=Warrior,Rogue,Druid,Shaman
+fill=Melee
+
+Grp=5
+wants=Range
+require Healer>=1, Shaman>=1
+avoid=Melee>0
+prefer=Warlock,Mage,Priest,Druid
+fill=Healer,Range
+
+Grp=6
+wants=Range
+require Healer>=1, Shaman>=1
+avoid=Melee>0
+prefer=Mage,Warlock,Priest,Druid
+fill=Healer,Range
+
+Grp=7
+wants=Healer
+require Healer>=2
+avoid=Melee>0
+prefer=Priest,Shaman,Druid,Warlock,Mage
+fill=Healer,Range
+
+Grp=8
+wants=Healer
+require Healer>=2
+avoid=Melee>0
+prefer=Priest,Shaman,Druid,Warlock,Mage
+fill=Healer,Range
+]]
+
+local DEFAULT_SORT_TEXT = SORT_TEMPLATE_40
+
 -- UI refs
 local mainFrame
 local tabGroup
@@ -686,6 +835,19 @@ local function getClassOf(name)
   return rec and rec.class or nil
 end
 
+-- Heuristic: infer a default role from class for non-hybrids
+-- Only assigns for clear, non-hybrid classes by default.
+local function inferDefaultRoleByClass(name)
+  local cls = (getClassOf(name) or ""):upper()
+  if cls == "ROGUE" then return "melee" end
+  if cls == "MAGE" then return "range" end
+  if cls == "WARLOCK" then return "range" end
+  if cls == "HUNTER" then return "range" end
+  -- Optionally, default WARRIOR to melee if desired; keep commented to be conservative
+  -- if cls == "WARRIOR" then return "melee" end
+  return nil
+end
+
 -- ==============================
 -- Excluded: zentraler Guard
 -- ==============================
@@ -747,6 +909,198 @@ local function ensureWhisperStore()
   MyRaidAddon.db.profile.whisperHistory = MyRaidAddon.db.profile.whisperHistory or {}
   return MyRaidAddon.db.profile.whisperHistory
 end
+
+-- ==============================
+-- Group History Snapshots
+-- ==============================
+local function ensureGroupHistory()
+  MyRaidAddon.db.profile.groupHistory = MyRaidAddon.db.profile.groupHistory or {}
+  return MyRaidAddon.db.profile.groupHistory
+end
+
+local function toLockIdString(ms, ls)
+  if type(ms) ~= "number" or type(ls) ~= "number" then return nil end
+  if ms == 0 and ls == 0 then return nil end
+  if ms < 0 then ms = 0 end
+  if ls < 0 then ls = 0 end
+  return string.format("%d-%d", ms, ls)
+end
+
+local function recordGroupHistoryEntry(entry)
+  local history = ensureGroupHistory()
+  table.insert(history, 1, entry)
+  while #history > GROUP_HISTORY_MAX do table.remove(history) end
+  if not MyRaidAddon._groupHistorySelectedIndex or MyRaidAddon._groupHistorySelectedIndex < 1 then
+    MyRaidAddon._groupHistorySelectedIndex = 1
+  end
+  if refreshGroupHistoryView then refreshGroupHistoryView() end
+end
+
+local function collectRosterSnapshot()
+  local roster = {}
+  local roleSummary = { tank = 0, healer = 0, melee = 0, range = 0, other = 0 }
+  local totalIlvl, countIlvl = 0, 0
+  local assignments = (MyRaidAddon.db and MyRaidAddon.db.profile and MyRaidAddon.db.profile.roleAssignments) or {}
+  local invited = (MyRaidAddon.db and MyRaidAddon.db.profile and MyRaidAddon.db.profile.invitedPlayers) or {}
+
+  local function takeIlvl(value)
+    local v = tonumber(value)
+    if v and v > 0 then
+      totalIlvl = totalIlvl + v
+      countIlvl = countIlvl + 1
+      return v
+    end
+    return nil
+  end
+
+  local function resolveRole(fullName, combatRole, unitToken)
+    local role = assignments[fullName]
+    if role and role ~= "" then return role end
+    local rec = invited[fullName]
+    if rec and rec.lastRole and rec.lastRole ~= "" then return rec.lastRole end
+    if combatRole == "TANK" then return "tank" end
+    if combatRole == "HEALER" then return "healer" end
+    if combatRole == "DAMAGER" then
+      local unitRole = UnitGroupRolesAssigned and unitToken and UnitGroupRolesAssigned(unitToken)
+      if unitRole == "TANK" then return "tank" end
+      if unitRole == "HEALER" then return "healer" end
+    end
+    if inferDefaultRoleByClass then
+      local fallback = inferDefaultRoleByClass(fullName)
+      if fallback and fallback ~= "" then return fallback end
+    end
+    return nil
+  end
+
+  local function bumpRole(roleKey)
+    if roleKey == "tank" or roleKey == "healer" or roleKey == "melee" or roleKey == "range" then
+      roleSummary[roleKey] = (roleSummary[roleKey] or 0) + 1
+    elseif roleKey == "dps" or roleKey == "damager" then
+      roleSummary.other = roleSummary.other + 1
+    else
+      roleSummary.other = roleSummary.other + 1
+    end
+  end
+
+  local function push(entry)
+    entry.ilvl = takeIlvl(entry.ilvl)
+    bumpRole(entry.roleKey)
+    table.insert(roster, entry)
+  end
+
+  if IsInRaid() then
+    for i=1, GetNumGroupMembers() do
+      local name, _, subgroup, level, className, classFile, zone, online, isDead, role, _, combatRole = GetRaidRosterInfo(i)
+      if name then
+        local full = getFullPlayerName(name)
+        local unitToken = "raid"..i
+        local rec = invited[full]
+        local ilvl = playerItemLevels[full] or (rec and rec.ilvl) or nil
+        local roleKey = resolveRole(full, combatRole, unitToken)
+        if not roleKey and combatRole == "DAMAGER" and rec and rec.lastRole then roleKey = rec.lastRole end
+        push({
+          name = full,
+          shortName = name,
+          className = className,
+          classToken = classFile,
+          subgroup = subgroup,
+          level = level,
+          zone = zone,
+          online = online and true or false,
+          isDead = isDead and true or false,
+          raidRole = role,
+          combatRole = combatRole,
+          roleKey = roleKey,
+          ilvl = ilvl,
+        })
+      end
+    end
+  elseif IsInGroup() then
+    local function addUnit(unitToken)
+      if not UnitExists or not UnitExists(unitToken) then return end
+      local full = GetUnitName(unitToken, true)
+      if not full then return end
+      local short = GetUnitName(unitToken, false)
+      local localizedClass, classToken = UnitClass(unitToken)
+      local level = UnitLevel(unitToken)
+      local online = UnitIsConnected(unitToken)
+      local isDead = UnitIsDeadOrGhost(unitToken)
+      local combatRole = UnitGroupRolesAssigned and UnitGroupRolesAssigned(unitToken) or nil
+      local rec = invited[full]
+      local ilvl = playerItemLevels[full] or (rec and rec.ilvl) or nil
+      local roleKey = resolveRole(full, combatRole, unitToken)
+      if not roleKey and combatRole == "DAMAGER" and rec and rec.lastRole then roleKey = rec.lastRole end
+      push({
+        name = full,
+        shortName = short,
+        className = localizedClass,
+        classToken = classToken,
+        subgroup = 1,
+        level = level,
+        zone = nil,
+        online = online and true or false,
+        isDead = isDead and true or false,
+        raidRole = nil,
+        combatRole = combatRole,
+        roleKey = roleKey,
+        ilvl = ilvl,
+      })
+    end
+    addUnit("player")
+    for i=1, GetNumSubgroupMembers() do addUnit("party"..i) end
+  end
+
+  table.sort(roster, function(a, b)
+    local sa = a.subgroup or 9
+    local sb = b.subgroup or 9
+    if sa ~= sb then return sa < sb end
+    return (a.name or "") < (b.name or "")
+  end)
+
+  local avg = (countIlvl > 0) and math.floor((totalIlvl / countIlvl) + 0.5) or nil
+  return roster, roleSummary, {
+    total = totalIlvl,
+    count = countIlvl,
+    average = avg,
+  }
+end
+
+local function captureGroupSnapshot(meta)
+  if not IsInGroup() then return end
+  local roster, roleSummary, ilvlStats = collectRosterSnapshot()
+  if not roster or #roster == 0 then return end
+
+  local instName, instType, difficultyID, difficultyName, maxPlayers, _, _, mapID, instanceGroupSize = GetInstanceInfo()
+  local lockSeconds, locked, extended, ms, ls
+  if GetInstanceLockTimeRemaining then
+    lockSeconds, locked, extended, ms, ls = GetInstanceLockTimeRemaining()
+  end
+
+  local entry = {
+    timestamp      = time(),
+    reason         = meta and meta.reason or nil,
+    encounterName  = meta and meta.encounterName or nil,
+    encounterID    = meta and meta.encounterID or nil,
+    success        = meta and meta.success,
+    difficultyID   = meta and meta.difficultyID or difficultyID,
+    difficultyName = difficultyName,
+    raidSize       = meta and meta.raidSize or instanceGroupSize or maxPlayers,
+    instanceName   = instName,
+    instanceType   = instType,
+    mapID          = mapID,
+    lockId         = toLockIdString(ms, ls),
+    lockSeconds    = lockSeconds,
+    locked         = locked,
+    extended       = extended,
+    roster         = roster,
+    roleSummary    = roleSummary,
+    ilvlStats      = ilvlStats,
+  }
+
+  MyRaidAddon._groupHistorySelectedIndex = 1
+  recordGroupHistoryEntry(entry)
+end
+
 local function logWhisper(name, text, dir)
   local store = ensureWhisperStore()
   if not name or not text or text=="" then return end
@@ -999,7 +1353,7 @@ local function parseSortRules(text)
         if token ~= "" then
           -- detect keywords inside definition
           if token:lower():find("^avoid%s+") then
-            ensureCur(); cur.avoid[ trim(token:sub(7)) ] = true
+            ensureCur(); local raw = trim(token:sub(7)); local base = raw:match("^([%w_]+)") or raw; cur.avoid[base] = true
           elseif token:lower():find("^require%s+") then
             ensureCur(); table.insert(cur.require, trim(token:sub(9)))
           elseif token:lower():find("^wants%s*=") then
@@ -1065,6 +1419,46 @@ local function parseSortRules(text)
       end
     elseif ln:match("^GrpType%s*=") then
       if cur then cur.GrpType = trim(ln:match("^GrpType%s*=%s*(.+)$") or "") end
+    elseif ln:match("^wants%s*=") then
+      ensureCur()
+      local body = trim(ln:match("^wants%s*=%s*(.+)$") or "")
+      if body ~= "" then
+        for _,tag in ipairs(splitCSV(body)) do
+          if tag ~= "" then table.insert(cur.wants, tag) end
+        end
+      end
+    elseif ln:match("^prefer%s*=") then
+      ensureCur()
+      local body = trim(ln:match("^prefer%s*=%s*(.+)$") or "")
+      cur.prefer = splitCSV(body)
+    elseif ln:match("^avoid%s*[= ]") then
+      ensureCur()
+      local body = trim(ln:match("^avoid%s*[= ]%s*(.+)$") or "")
+      if body ~= "" then
+        for _,token in ipairs(splitCSV(body)) do
+          if token ~= "" then
+            local key = trim(token)
+            local base = key:match("^([%w_]+)") or key
+            cur.avoid[base] = true
+          end
+        end
+      end
+    elseif ln:lower():match("^require%s") then
+      ensureCur()
+      local body = trim(ln:match("^require%s*[= ]%s*(.+)$") or "")
+      if body ~= "" then
+        for _,token in ipairs(splitCSV(body)) do
+          if token ~= "" then table.insert(cur.require, token) end
+        end
+      end
+    elseif ln:match("^fill%s*=") then
+      ensureCur()
+      local body = trim(ln:match("^fill%s*=%s*(.+)$") or "")
+      if body ~= "" then
+        for _,token in ipairs(splitCSV(body)) do
+          if token ~= "" then cur.fill[token:upper()] = true end
+        end
+      end
     elseif ln:match("^definition%s*=") then
       if cur then cur.definition = trim(ln:match("^definition%s*=%s*(.+)$") or "") end
     end
@@ -1127,6 +1521,255 @@ local function collectRosterBuckets()
   purgeExcluded(byRole)
 
   return byClass, byRole
+end
+
+local function dupList(src)
+  local dst = {}
+  if type(src) == "table" then
+    for i=1,#src do dst[i] = src[i] end
+  end
+  return dst
+end
+
+local function dupMap(src)
+  local dst = {}
+  if type(src) == "table" then
+    for k,v in pairs(src) do dst[k] = v end
+  end
+  return dst
+end
+
+local function dupOps(op)
+  local res = {class={}, role={}}
+  if type(op) ~= "table" then return res end
+  if type(op.class) == "table" then
+    for k,v in pairs(op.class) do
+      if type(v) == "table" then
+        res.class[k] = { op = v.op, val = v.val }
+      end
+    end
+  end
+  if type(op.role) == "table" then
+    for k,v in pairs(op.role) do
+      if type(v) == "table" then
+        res.role[k] = { op = v.op, val = v.val }
+      end
+    end
+  end
+  return res
+end
+
+local function buildDynamicSortLayout(totalPlayers, neededGroups)
+  local layout = {}
+
+  local function makeSet(list)
+    local set = {}
+    if type(list) == "table" then
+      for _,entry in ipairs(list) do
+        local key = trim(entry)
+        if key and key ~= "" then
+          local base = key:match("^([%w_]+)") or key
+          set[base] = true
+        end
+      end
+    end
+    return set
+  end
+
+  local function makeFill(list)
+    local map = {}
+    if type(list) == "table" then
+      for _,entry in ipairs(list) do
+        if entry and entry ~= "" then map[entry:upper()] = true end
+      end
+    end
+    return map
+  end
+
+  local function setGroup(index, opts)
+    if not opts then return end
+    layout[index] = {
+      GrpType = opts.tag or opts.GrpType or opts.type,
+      wants   = dupList(opts.wants),
+      require = dupList(opts.require),
+      prefer  = dupList(opts.prefer),
+      avoid   = makeSet(opts.avoid),
+      fill    = makeFill(opts.fill),
+      op      = { class = {}, role = {} },
+    }
+  end
+
+  local defs2 = {
+    {
+      tag = "TankCore",
+      wants = {"Melee"},
+      require = {"Tank=1"},
+      avoid = {"Healer>2", "Range>2"},
+      prefer = {"Warrior", "Shaman", "Druid", "Hunter"},
+      fill = {"Tank", "Healer", "Melee"},
+    },
+    {
+      tag = "Caster",
+      wants = {"Range"},
+      require = {"Healer>=2"},
+      avoid = {"Tank>1"},
+      prefer = {"Shaman", "Priest", "Mage", "Warlock", "Hunter"},
+      fill = {"Healer", "Range"},
+    },
+  }
+
+  local defs4 = {
+    {
+      tag = "TankCore",
+      wants = {"Melee"},
+      require = {"Tank=1", "Shaman>=1"},
+      avoid = {"Healer>1", "Range>2"},
+      prefer = {"Warrior", "Shaman", "Druid", "Hunter"},
+      fill = {"Tank", "Healer", "Melee"},
+    },
+    {
+      tag = "TankCore",
+      wants = {"Melee"},
+      require = {"Tank=1", "Shaman>=1"},
+      avoid = {"Healer>1", "Range>2"},
+      prefer = {"Warrior", "Shaman", "Druid", "Hunter"},
+      fill = {"Tank", "Healer", "Melee"},
+    },
+    {
+      tag = "Melee",
+      wants = {"Melee"},
+      require = {"Shaman>=1"},
+      avoid = {"Healer>1"},
+      prefer = {"Warrior", "Rogue", "Druid", "Shaman"},
+      fill = {"Melee"},
+    },
+    {
+      tag = "Caster",
+      wants = {"Range"},
+      require = {"Healer>=1", "Shaman>=1"},
+      avoid = {"Melee>2"},
+      prefer = {"Mage", "Warlock", "Priest", "Druid", "Shaman"},
+      fill = {"Healer", "Range"},
+    },
+  }
+
+  local defs6 = {
+    defs4[1],
+    defs4[2],
+    defs4[3],
+    {
+      tag = "Melee",
+      wants = {"Melee"},
+      require = {},
+      avoid = {"Healer>1"},
+      prefer = {"Warrior", "Rogue", "Druid", "Shaman"},
+      fill = {"Melee"},
+    },
+    {
+      tag = "Caster",
+      wants = {"Range"},
+      require = {"Healer>=1", "Shaman>=1"},
+      avoid = {"Melee>1"},
+      prefer = {"Warlock", "Mage", "Priest", "Druid"},
+      fill = {"Healer", "Range"},
+    },
+    {
+      tag = "Caster",
+      wants = {"Range"},
+      require = {"Healer>=1"},
+      avoid = {"Melee>1"},
+      prefer = {"Mage", "Warlock", "Priest", "Druid"},
+      fill = {"Healer", "Range"},
+    },
+  }
+
+  local defs8 = {
+    {
+      tag = "TankCore",
+      wants = {"Melee"},
+      require = {"Tank=1", "Shaman>=1"},
+      avoid = {"Healer>1", "Range>1"},
+      prefer = {"Warrior", "Rogue", "Druid", "Hunter", "Shaman"},
+      fill = {"Tank", "Melee"},
+    },
+    {
+      tag = "TankCore",
+      wants = {"Melee"},
+      require = {"Tank=1", "Shaman>=1"},
+      avoid = {"Healer>1", "Range>1"},
+      prefer = {"Warrior", "Rogue", "Druid", "Hunter", "Shaman"},
+      fill = {"Tank", "Melee"},
+    },
+    {
+      tag = "Melee",
+      wants = {"Melee"},
+      require = {"Shaman>=1"},
+      avoid = {"Healer>=1", "Range>0"},
+      prefer = {"Warrior", "Rogue", "Druid", "Shaman"},
+      fill = {"Melee"},
+    },
+    {
+      tag = "Melee",
+      wants = {"Melee"},
+      require = {"Shaman>=1"},
+      avoid = {"Healer>=1", "Range>0"},
+      prefer = {"Warrior", "Rogue", "Druid", "Shaman"},
+      fill = {"Melee"},
+    },
+    {
+      tag = "Caster",
+      wants = {"Range"},
+      require = {"Healer>=1", "Shaman>=1"},
+      avoid = {"Melee>0"},
+      prefer = {"Warlock", "Mage", "Priest", "Druid"},
+      fill = {"Healer", "Range"},
+    },
+    {
+      tag = "Caster",
+      wants = {"Range"},
+      require = {"Healer>=1", "Shaman>=1"},
+      avoid = {"Melee>0"},
+      prefer = {"Mage", "Warlock", "Priest", "Druid"},
+      fill = {"Healer", "Range"},
+    },
+    {
+      tag = "Healer",
+      wants = {"Healer"},
+      require = {"Healer>=2"},
+      avoid = {"Melee>0"},
+      prefer = {"Priest", "Shaman", "Druid", "Warlock", "Mage"},
+      fill = {"Healer", "Range"},
+    },
+    {
+      tag = "Healer",
+      wants = {"Healer"},
+      require = {"Healer>=2"},
+      avoid = {"Melee>0"},
+      prefer = {"Priest", "Shaman", "Druid", "Warlock", "Mage"},
+      fill = {"Healer", "Range"},
+    },
+  }
+
+  local tiers = {
+    { max = 2, defs = defs2 },
+    { max = 4, defs = defs4 },
+    { max = 6, defs = defs6 },
+    { max = 8, defs = defs8 },
+  }
+
+  local chosen = tiers[#tiers].defs
+  for _,tier in ipairs(tiers) do
+    if neededGroups <= tier.max then
+      chosen = tier.defs
+      break
+    end
+  end
+
+  for idx = 1, neededGroups do
+    setGroup(idx, chosen[idx])
+  end
+
+  return layout
 end
 
 local function opCheck(actual, op, val)
@@ -1211,18 +1854,39 @@ local function applySortRules()
   local byClass, byRole = collectRosterBuckets()
 
   local sortText = MyRaidAddon.db.profile.sortRulesText or DEFAULT_SORT_TEXT
+  local usingDefaultTemplate = (sortText == DEFAULT_SORT_TEXT) or (sortText == LEGACY_SORT_TEXT_V1)
   local groupsDef, global = parseSortRules(sortText)
 
   local total = GetNumGroupMembers()
   local neededGroups = math.min(8, math.max(1, math.ceil(total / 5)))
 
+  local dynamicLayout = nil
+  if usingDefaultTemplate then
+    dynamicLayout = buildDynamicSortLayout(total, neededGroups)
+  end
+
   local groups = {}
   for g=1,neededGroups do
-    local def = groupsDef[g] or {grp=g, def={}, GrpType=nil, op={class={},role={}}, fill={}, avoid={}, require={}, wants={}, prefer={}}
+    local baseDef = (dynamicLayout and dynamicLayout[g]) or groupsDef[g] or {}
+    local wants = dupList(baseDef.wants)
+    local prefer = dupList(baseDef.prefer)
+    local requireList = dupList(baseDef.require)
+    local avoidMap = dupMap(baseDef.avoid)
+    local fillMap = dupMap(baseDef.fill)
+    local ops = dupOps(baseDef.op or {})
+    if not ops.class then ops.class = {} end
+    if not ops.role then ops.role = {} end
     groups[g] = {
-      members={}, size=0, tag=def.GrpType,
-      op=def.op, fill=def.fill, avoid=def.avoid, require=def.require, wants=def.wants, prefer=def.prefer
+      members = {},
+      size = 0,
+      tag = baseDef.GrpType or baseDef.tag or (wants[1])
     }
+    groups[g].op = ops
+    groups[g].fill = fillMap
+    groups[g].avoid = avoidMap
+    groups[g].require = requireList
+    groups[g].wants = wants
+    groups[g].prefer = prefer
   end
 
   local placed = {}
@@ -1245,6 +1909,130 @@ local function applySortRules()
     end
     return taken
   end
+
+  local function seedTankCoreGroups()
+    local cfg = currentRaidCfg() or {}
+    local approxBySize = math.max(1, math.ceil(total / 20))
+    local targetTankGroups = math.min(neededGroups, math.max(cfg.NeedTanks or 1, approxBySize))
+    if targetTankGroups <= 0 then return end
+
+    local classCache = {}
+    local function nameClass(name)
+      if not name then return "" end
+      if classCache[name] == nil then
+        local cls = getClassOf(name)
+        classCache[name] = (cls and cls:upper()) or ""
+      end
+      return classCache[name]
+    end
+
+    local function copyDistinct(sourceLists, predicate)
+      local out, seen = {}, {}
+      for _,src in ipairs(sourceLists or {}) do
+        if src then
+          for _,name in ipairs(src) do
+            if name and not seen[name] and not placed[name] then
+              local cls = nameClass(name)
+              if not predicate or predicate(cls, name) then
+                table.insert(out, name)
+                seen[name] = true
+              end
+            end
+          end
+        end
+      end
+      return out
+    end
+
+    local tankCandidates = {}
+    for g=1,neededGroups do
+      local wants = groups[g].wants or {}
+      local isMeleeGroup = false
+      for _,tag in ipairs(wants) do
+        if tag and tag:upper()=="MELEE" then isMeleeGroup=true; break end
+      end
+      local requiresTank = false
+      for _,req in ipairs(groups[g].require or {}) do
+        if type(req)=="string" and req:upper():find("TANK") then requiresTank=true; break end
+      end
+      if not requiresTank then
+        for key,_ in pairs(groups[g].op.role or {}) do
+          if key=="TANK" then requiresTank=true; break end
+        end
+      end
+      if isMeleeGroup or requiresTank then table.insert(tankCandidates, g) end
+    end
+
+    local tankGroups = {}
+    for _,g in ipairs(tankCandidates) do
+      if not listContains(tankGroups, g) then
+        table.insert(tankGroups, g)
+        if #tankGroups >= targetTankGroups then break end
+      end
+    end
+    local fallback = 1
+    while #tankGroups < targetTankGroups and fallback <= neededGroups do
+      if not listContains(tankGroups, fallback) then
+        table.insert(tankGroups, fallback)
+      end
+      fallback = fallback + 1
+    end
+    if #tankGroups == 0 then return end
+
+    local warriorTankPool = copyDistinct({activeTank, byRole and byRole.Tank, byClass and byClass.WARRIOR}, function(cls)
+      return cls=="WARRIOR"
+    end)
+    local tankPool = copyDistinct({activeTank, byRole and byRole.Tank})
+    local shamanPool = copyDistinct({byClass and byClass.SHAMAN, activeHealer, activeMelee})
+    local feralPool = copyDistinct({activeMelee, activeTank, byClass and byClass.DRUID}, function(cls)
+      return cls=="DRUID"
+    end)
+    local hunterPool = copyDistinct({activeRange, byClass and byClass.HUNTER}, function(cls)
+      return cls=="HUNTER"
+    end)
+    local meleePool = copyDistinct({activeMelee, byClass and byClass.ROGUE, byClass and byClass.WARRIOR, byClass and byClass.DRUID, byClass and byClass.SHAMAN}, function(cls)
+      return cls=="ROGUE" or cls=="WARRIOR" or cls=="DRUID" or cls=="SHAMAN"
+    end)
+
+    local function pickAndAdd(pool, count, g)
+      local addedNames = {}
+      for _=1,count do
+        if not hasSpace(g) then break end
+        local candidates = {}
+        for _,name in ipairs(pool) do
+          if not placed[name] then table.insert(candidates, name) end
+        end
+        if #candidates == 0 then break end
+        local picked = takeFromPool(candidates, 1, g)
+        if #picked == 0 then break end
+        local name = picked[1]
+        table.insert(addedNames, name)
+        for idx=#pool,1,-1 do
+          if pool[idx] == name then table.remove(pool, idx); break end
+        end
+      end
+      return addedNames
+    end
+
+    for _,g in ipairs(tankGroups) do
+      if hasSpace(g) then
+        if #pickAndAdd(warriorTankPool, 1, g)==0 then
+          pickAndAdd(tankPool, 1, g)
+        end
+        pickAndAdd(shamanPool, 1, g)
+        if #pickAndAdd(feralPool, 1, g)==0 then
+          pickAndAdd(hunterPool, 1, g)
+        end
+
+        local remaining = 5 - groups[g].size
+        if remaining > 0 then
+          pickAndAdd(meleePool, math.min(remaining, 2), g)
+        end
+      end
+    end
+  end
+
+  seedTankCoreGroups()
 
   -- helper counts
   local function countIn(arr, pred)
@@ -1537,6 +2325,17 @@ local function onWhisperOut(_, msg, target)
   end
 end
 
+local function onEncounterEnd(_, encounterID, encounterName, difficultyID, raidSize, endStatus)
+  captureGroupSnapshot({
+    reason = "ENCOUNTER_END",
+    encounterID = encounterID,
+    encounterName = encounterName,
+    difficultyID = difficultyID,
+    raidSize = raidSize,
+    success = (endStatus == 1),
+  })
+end
+
 -- ==============================
 -- Inspect Ergebnis
 -- ==============================
@@ -1615,6 +2414,29 @@ local function postRaid(raidKey)
     end
   end
   if not sent then print("No valid channel selected for LFM message.") end
+end
+
+local function postLinks()
+  local sr = (MyRaidAddon.db.profile.srLink or ""):match("%S") and MyRaidAddon.db.profile.srLink or nil
+  local dc = (MyRaidAddon.db.profile.discordLink or ""):match("%S") and MyRaidAddon.db.profile.discordLink or nil
+  if not sr and not dc then print("|cffffaa00[LFM]|r No links to post.") return end
+  local inRaid = IsInRaid()
+  local inGroup = IsInGroup()
+  local chatType
+  if inRaid then
+    if MyRaidAddon.db.profile.raidWarnEnabled and (UnitIsGroupLeader("player") or UnitIsGroupAssistant("player")) then
+      chatType = "RAID_WARNING"
+    else
+      chatType = "RAID"
+    end
+  elseif inGroup then
+    chatType = "PARTY"
+  else
+    print("|cffffaa00[LFM]|r Not in party/raid; cannot post to group.")
+    return
+  end
+  if sr then SendChatMessage("SR: "..sr, chatType) end
+  if dc then SendChatMessage("Discord: "..dc, chatType) end
 end
 
 -- ==============================
@@ -1738,29 +2560,6 @@ local function buildMainTab(container)
 
   local cbRW = AceGUI:Create("CheckBox"); cbRW:SetLabel("Raid Warning (/rw)"); cbRW:SetValue(MyRaidAddon.db.profile.raidWarnEnabled); cbRW:SetWidth(150); row0:AddChild(cbRW)
   cbRW:SetCallback("OnValueChanged", function(_,_,v) MyRaidAddon.db.profile.raidWarnEnabled = v and true or false end)
-
-  local function postLinks()
-    local sr = (MyRaidAddon.db.profile.srLink or ""):match("%S") and MyRaidAddon.db.profile.srLink or nil
-    local dc = (MyRaidAddon.db.profile.discordLink or ""):match("%S") and MyRaidAddon.db.profile.discordLink or nil
-    if not sr and not dc then print("|cffffaa00[LFM]|r No links to post.") return end
-    local inRaid = IsInRaid()
-    local inGroup = IsInGroup()
-    local chatType
-    if inRaid then
-      if MyRaidAddon.db.profile.raidWarnEnabled and (UnitIsGroupLeader("player") or UnitIsGroupAssistant("player")) then
-        chatType = "RAID_WARNING"
-      else
-        chatType = "RAID"
-      end
-    elseif inGroup then
-      chatType = "PARTY"
-    else
-      print("|cffffaa00[LFM]|r Not in party/raid; cannot post to group.")
-      return
-    end
-    if sr then SendChatMessage("SR: "..sr, chatType) end
-    if dc then SendChatMessage("Discord: "..dc, chatType) end
-  end
 
   local btnPostLinks = AceGUI:Create("Button"); btnPostLinks:SetText("Post Links"); btnPostLinks:SetWidth(120); row0:AddChild(btnPostLinks)
   btnPostLinks:SetCallback("OnClick", function() postLinks() end)
@@ -2299,83 +3098,116 @@ local function showHistoryContext(name, anchorWidget)
     updatePlayersWithoutRole(); updatePlayerStatuses(); if RebuildActiveTab then RebuildActiveTab() end
   end
 
-  local menu = {
-    { text = name, isTitle = true, notCheckable = true },
-    { text = "Assign Role...", notCheckable = true, func = function() MyRaidAddon:OpenAssignWindow(name, anchorWidget and anchorWidget.frame) end },
+  -- Use the same assign window as Roles
+  MyRaidAddon:OpenAssignWindow(name, anchorWidget and anchorWidget.frame)
 
 
 
 
 
-    { text = "/who Player", notCheckable = true, func = function() doWhoQuery(name) end },
-    { text = "Whisper",      notCheckable = true, func = function() if ChatFrame_OpenChat then ChatFrame_OpenChat("/w "..name.." ") end end },
-    { text = "Invite",       notCheckable = true, func = function() InviteIfNotExcluded(name); MyRaidAddon:AddToInvitedPlayers(name, data.lastRole, "invited"); updatePlayerStatuses(); if RebuildActiveTab then RebuildActiveTab() end end },
-    { text = "Remove from Group", notCheckable = true, func = function() if UninviteUnit then UninviteUnit(name) end; updatePlayerStatuses(); if RebuildActiveTab then RebuildActiveTab() end end },
-    { text = "Exclude Player",    notCheckable = true, func = function() MyRaidAddon.db.profile.invitedPlayers[name] = MyRaidAddon.db.profile.invitedPlayers[name] or {}; MyRaidAddon.db.profile.invitedPlayers[name].status = "Excluded"; removeFromAllActiveLists(name); updatePlayersWithoutRole(); updatePlayerStatuses(); if RebuildActiveTab then RebuildActiveTab() end end },
-    { text = "Refresh ilvl",      notCheckable = true, func = function() local unitMatch; for unit in IterateGroup() do local unitName = GetUnitName(unit, true); if unitName and getFullPlayerName(unitName) == name then unitMatch = unit; break end end; if unitMatch then queueInspect(unitMatch); print("|cff33ff99[LFM]|r Inspect queued for "..name) else print("|cffffaa00[LFM]|r "..name.." is not currently in your group for inspection.") end end },
-    { text = "Open Whisper Log", notCheckable = true, func = function() showWhisperDetail(name) end },
-    { text = "Clear Chat Log",  notCheckable = true, func = function() if store[name] then store[name] = {} end; if RebuildActiveTab then RebuildActiveTab() end end },
-    { text = "Remove from DB",  notCheckable = true, func = function() MyRaidAddon.db.profile.invitedPlayers[name] = nil; removeFromAllActiveLists(name); updatePlayersWithoutRole(); updatePlayerStatuses(); if RebuildActiveTab then RebuildActiveTab() end end },
-  }
-  local anchor = anchorWidget and anchorWidget.frame or nil
-  openDropdownAt(anchor, menu)
+
+
+
+
+
+
+
+
+
+
+  
 end
 
 -- ==============================
 -- Tabs: History
 -- ==============================
+
+
+
 local function buildHistoryTab(container)
   container:ReleaseChildren()
   local root = AceGUI:Create("SimpleGroup"); root:SetLayout("Flow"); root:SetFullWidth(true); root:SetFullHeight(true); container:AddChild(root)
 
-  -- Top: scrollable table (height adjusted responsively)
-  local scroll = AceGUI:Create("ScrollFrame"); scroll:SetLayout("Flow"); scroll:SetFullWidth(true); scroll:SetHeight(420); root:AddChild(scroll)
+  local showGroup = MyRaidAddon.db.profile.historyShowGroup and true or false
+
+  local toggleRow = AceGUI:Create("SimpleGroup"); toggleRow:SetLayout("Flow"); toggleRow:SetFullWidth(true); root:AddChild(toggleRow)
+  MyRaidAddon._historyToggleRow = toggleRow
+  local toggle = AceGUI:Create("CheckBox"); toggle:SetLabel("Show Group/Raid History"); toggle:SetValue(showGroup); toggle:SetWidth(220)
+  toggle:SetCallback("OnValueChanged", function(_,_,val)
+    MyRaidAddon.db.profile.historyShowGroup = val and true or false
+    buildHistoryTab(container)
+  end)
+  toggleRow:AddChild(toggle)
+  local hint = AceGUI:Create("Label"); hint:SetText("|cffaaaaaaToggle between whisper history and recorded raid/instance rosters.|r"); hint:SetRelativeWidth(0.7); toggleRow:AddChild(hint)
+
+  if showGroup then
+    MyRaidAddon._histExcluded = nil
+    MyRaidAddon._histRecent = nil
+    MyRaidAddon._historyViewBox = nil
+    MyRaidAddon._historyViewScroll = nil
+    MyRaidAddon._groupHistoryWrap = nil
+    MyRaidAddon._groupHistoryListBox = nil
+    MyRaidAddon._groupHistoryDetailBox = nil
+
+    local wrap = AceGUI:Create("SimpleGroup"); wrap:SetLayout("Flow"); wrap:SetFullWidth(true); wrap:SetFullHeight(true); root:AddChild(wrap)
+
+    local listBox = AceGUI:Create("InlineGroup"); listBox:SetTitle(string.format("Group History (max %d)", GROUP_HISTORY_MAX)); listBox:SetLayout("Fill"); listBox:SetRelativeWidth(0.42); listBox:SetFullHeight(true); wrap:AddChild(listBox)
+    local listScroll = AceGUI:Create("ScrollFrame"); listScroll:SetLayout("Flow"); listScroll:SetFullWidth(true); listScroll:SetFullHeight(true); listBox:AddChild(listScroll)
+
+    local detailBox = AceGUI:Create("InlineGroup"); detailBox:SetTitle("Roster & ilvl Details"); detailBox:SetLayout("Fill"); detailBox:SetRelativeWidth(0.58); detailBox:SetFullHeight(true); wrap:AddChild(detailBox)
+    local detailScroll = AceGUI:Create("ScrollFrame"); detailScroll:SetLayout("List"); detailScroll:SetFullWidth(true); detailScroll:SetFullHeight(true); detailBox:AddChild(detailScroll)
+
+    MyRaidAddon._groupHistoryList = listScroll
+    MyRaidAddon._groupHistoryDetail = detailScroll
+    MyRaidAddon._groupHistoryWrap = wrap
+    MyRaidAddon._groupHistoryListBox = listBox
+    MyRaidAddon._groupHistoryDetailBox = detailBox
+
+    refreshGroupHistoryView("reset")
+    if MyRaidAddon.AdjustHistoryHeights then MyRaidAddon:AdjustHistoryHeights() end
+    return
+  end
+
+  MyRaidAddon._groupHistoryList = nil
+  MyRaidAddon._groupHistoryDetail = nil
+  MyRaidAddon._groupHistoryWrap = nil
+  MyRaidAddon._groupHistoryListBox = nil
+  MyRaidAddon._groupHistoryDetailBox = nil
 
   local db = MyRaidAddon.db.profile.invitedPlayers
   local store = ensureWhisperStore()
-
-  local header = AceGUI:Create("SimpleGroup"); header:SetFullWidth(true); header:SetLayout("Flow"); scroll:AddChild(header)
-  -- Sorting state defaults
-  MyRaidAddon.db.profile.historySortKey = MyRaidAddon.db.profile.historySortKey or "last"
-  if MyRaidAddon.db.profile.historySortAsc == nil then MyRaidAddon.db.profile.historySortAsc = false end
-  local curKey  = MyRaidAddon.db.profile.historySortKey
-  local curAsc  = MyRaidAddon.db.profile.historySortAsc and true or false
-  local function addHeader(label, rel, key)
-    local txt = label
-    if key and key == curKey then txt = label .. (curAsc and " ?" or " ?") end
-    local w = AceGUI:Create("InteractiveLabel"); w:SetText(txt); w:SetRelativeWidth(rel)
-    if key then
-      w:SetCallback("OnClick", function()
-        if MyRaidAddon.db.profile.historySortKey == key then
-          MyRaidAddon.db.profile.historySortAsc = not MyRaidAddon.db.profile.historySortAsc
-        else
-          MyRaidAddon.db.profile.historySortKey = key
-          -- Default for new key: by last date desc, others asc
-          MyRaidAddon.db.profile.historySortAsc = (key ~= "last")
-        end
-        RebuildActiveTab()
-      end)
+  local exclBox = AceGUI:Create("InlineGroup"); exclBox:SetTitle("Excluded"); exclBox:SetFullWidth(true); exclBox:SetLayout("Fill"); root:AddChild(exclBox)
+  local exclScroll = AceGUI:Create("ScrollFrame"); exclScroll:SetLayout("Flow"); exclBox:AddChild(exclScroll)
+  do
+    local header = AceGUI:Create("SimpleGroup"); header:SetFullWidth(true); header:SetLayout("Flow"); exclScroll:AddChild(header)
+    local function H(t,rel) local l=AceGUI:Create("Label"); l:SetText(t); l:SetRelativeWidth(rel); header:AddChild(l) end
+    H("Name",0.4); H("Last Role",0.2); H("ilvl",0.15); H("Status",0.15); H(" ",0.1)
+    local keys = {}
+    for k,v in pairs(db) do if v and v.status=="Excluded" then table.insert(keys, k) end end
+    table.sort(keys)
+    for _,name in ipairs(keys) do
+      local data = db[name] or {}
+      local row = AceGUI:Create("SimpleGroup"); row:SetFullWidth(true); row:SetLayout("Flow"); exclScroll:AddChild(row)
+      local display = "|c"..getClassColorCode(name)..name.."|r"
+      local nL = AceGUI:Create("InteractiveLabel"); nL:SetText(display); nL:SetRelativeWidth(0.4); row:AddChild(nL)
+      nL:SetCallback("OnClick", function(widget) MyRaidAddon:OpenAssignWindow(name, widget and widget.frame) end)
+      local rL = AceGUI:Create("Label"); rL:SetText((data.lastRole or "")); rL:SetRelativeWidth(0.2); row:AddChild(rL)
+      local iL = AceGUI:Create("Label"); iL:SetText(data.ilvl or ""); iL:SetRelativeWidth(0.15); row:AddChild(iL)
+      local sL = AceGUI:Create("Label"); sL:SetText("|cffff8800Excluded|r"); sL:SetRelativeWidth(0.15); row:AddChild(sL)
+      local opt = AceGUI:Create("InteractiveLabel"); opt:SetText("|cffbbbbbb...|r"); opt:SetRelativeWidth(0.1);
+      opt:SetCallback("OnClick", function(widget) MyRaidAddon:OpenAssignWindow(name, widget and widget.frame) end); row:AddChild(opt)
     end
-    header:AddChild(w)
+    if #keys==0 then local none=AceGUI:Create("Label"); none:SetText("No excluded players."); none:SetFullWidth(true); exclScroll:AddChild(none) end
   end
-  addHeader("Name", 0.28, "name")
-  addHeader("Last Role", 0.1, "role")
-  addHeader("ilvl", 0.08, "ilvl")
-  addHeader("Status", 0.18, "status")
-  addHeader("#Msgs", 0.08, "msgs")
-  addHeader("Last Whisper", 0.20, "last")
-  addHeader(" ", 0.08, nil)
 
-  -- Bottom: persistent, read-only whisper viewer (scrollable list)
-  local viewBox = AceGUI:Create("InlineGroup"); viewBox:SetTitle("Whisper Text"); viewBox:SetFullWidth(true); viewBox:SetHeight(130); viewBox:SetLayout("Fill"); root:AddChild(viewBox)
-  local viewScroll = AceGUI:Create("ScrollFrame"); viewScroll:SetLayout("List"); viewBox:AddChild(viewScroll)
-
+  local recentBox = AceGUI:Create("InlineGroup"); recentBox:SetTitle("Recent Players (last 20)"); recentBox:SetFullWidth(true); recentBox:SetLayout("Fill"); root:AddChild(recentBox)
+  local recentScroll = AceGUI:Create("ScrollFrame"); recentScroll:SetLayout("Flow"); recentBox:AddChild(recentScroll)
   local function updateViewer(name)
     local msgs = store[name] or {}
-    viewBox:SetTitle("Whisper Text: "..name)
-    viewScroll:ReleaseChildren()
+    MyRaidAddon._historyViewBox:SetTitle("Whisper Text: "..name)
+    local vs = MyRaidAddon._historyViewScroll; vs:ReleaseChildren()
     if #msgs == 0 then
-      local none = AceGUI:Create("Label"); none:SetText("(no messages)"); none:SetFullWidth(true); viewScroll:AddChild(none)
+      local none = AceGUI:Create("Label"); none:SetText("(no messages)"); none:SetFullWidth(true); vs:AddChild(none)
       return
     end
     for i=1,#msgs do
@@ -2385,168 +3217,42 @@ local function buildHistoryTab(container)
       local line = AceGUI:Create("Label")
       line:SetText(string.format("[%s] %s %s", ts, arrow, m.text or ""))
       line:SetFullWidth(true)
-      viewScroll:AddChild(line)
+      vs:AddChild(line)
     end
   end
+  do
+    local header = AceGUI:Create("SimpleGroup"); header:SetFullWidth(true); header:SetLayout("Flow"); recentScroll:AddChild(header)
+    local function H2(t,rel) local l=AceGUI:Create("Label"); l:SetText(t); l:SetRelativeWidth(rel); header:AddChild(l) end
+    H2("Name",1.0)
+    -- Build list of players by last whisper time (most recent first)
+    local items = {}
+    for name, msgs in pairs(store) do
+      local lastTime = 0
+      if type(msgs)=="table" and #msgs>0 then
+        local m = msgs[#msgs]
+        lastTime = (m and m.time) or 0
+      end
+      table.insert(items, {name=name, time=lastTime})
+    end
+    table.sort(items, function(a,b) return (a.time or 0) > (b.time or 0) end)
+    local limit = math.min(WHISPER_SHOW or 20, #items)
+    for i=1,limit do
+      local it = items[i]
+      local row = AceGUI:Create("SimpleGroup"); row:SetFullWidth(true); row:SetLayout("Flow"); recentScroll:AddChild(row)
+      local nameLbl = "|c"..getClassColorCode(it.name)..it.name.."|r"
+      local nL = AceGUI:Create("InteractiveLabel"); nL:SetText(nameLbl); nL:SetFullWidth(true); row:AddChild(nL)
+      nL:SetCallback("OnClick", function() updateViewer(it.name) end)
+    end
+    if limit==0 then local none=AceGUI:Create("Label"); none:SetText("No players yet."); none:SetFullWidth(true); recentScroll:AddChild(none) end
+  end
 
-  -- Keep references for responsive resize adjustments
-  MyRaidAddon._historyScroll = scroll
-  MyRaidAddon._historyViewBox = viewBox
+  local viewBox = AceGUI:Create("InlineGroup"); viewBox:SetTitle("Whisper Text"); viewBox:SetFullWidth(true); viewBox:SetLayout("Fill"); root:AddChild(viewBox)
+  local viewScroll = AceGUI:Create("ScrollFrame"); viewScroll:SetLayout("List"); viewBox:AddChild(viewScroll)
+  MyRaidAddon._histExcluded = exclScroll
+  MyRaidAddon._histRecent   = recentScroll
+  MyRaidAddon._historyViewBox   = viewBox
+  MyRaidAddon._historyViewScroll= viewScroll
   if MyRaidAddon.AdjustHistoryHeights then MyRaidAddon:AdjustHistoryHeights() end
-
-  -- Build sortable entries list
-  local keysMap = {}
-  for k,_ in pairs(db) do keysMap[k]=true end
-  for k,_ in pairs(store) do keysMap[k]=true end
-  local entries = {}
-  for name,_ in pairs(keysMap) do
-    local data = db[name] or {}
-    local msgs = store[name] or {}
-    local lastTsNum = 0
-    if #msgs > 0 and msgs[#msgs].time then lastTsNum = msgs[#msgs].time end
-    table.insert(entries, {
-      name = name,
-      role = data.lastRole or "",
-      ilvl = tonumber(data.ilvl) or 0,
-      status = data.status or "",
-      msgs = #msgs,
-      last = lastTsNum,
-    })
-  end
-  local key = MyRaidAddon.db.profile.historySortKey or "last"
-  local asc = MyRaidAddon.db.profile.historySortAsc and true or false
-  table.sort(entries, function(a,b)
-    local va, vb
-    if key == "name" then va, vb = a.name, b.name
-    elseif key == "role" then va, vb = a.role, b.role
-    elseif key == "ilvl" then va, vb = a.ilvl, b.ilvl
-    elseif key == "status" then va, vb = a.status, b.status
-    elseif key == "msgs" then va, vb = a.msgs, b.msgs
-    else va, vb = a.last, b.last end
-    if va == vb then return a.name < b.name end
-    if asc then return va < vb else return va > vb end
-  end)
-
-  if #entries==0 then
-    local none = AceGUI:Create("Label"); none:SetText("No history yet."); none:SetFullWidth(true); scroll:AddChild(none)
-    return
-  end
-
-  for _, e in ipairs(entries) do
-    local name = e.name
-    local data = db[name] or {}
-    local msgs = store[name] or {}
-    local lastTs = (e.last and e.last>0) and date("%Y-%m-%d %H:%M:%S", e.last) or "-"
-
-    local row = AceGUI:Create("SimpleGroup"); row:SetFullWidth(true); row:SetLayout("Flow"); scroll:AddChild(row)
-    local display = "|c"..getClassColorCode(name)..name.."|r"
-
-    local nL = AceGUI:Create("InteractiveLabel"); nL:SetText(display); nL:SetRelativeWidth(0.28)
-    nL:SetCallback("OnClick", function(widget, _, button)
-      if button=="RightButton" then
-        showHistoryContext(name, widget)
-      elseif IsShiftKeyDown() then
-        doWhoQuery(name)
-      else
-        updateViewer(name)
-      end
-    end); row:AddChild(nL)
-    local rL = AceGUI:Create("Label"); rL:SetText(data.lastRole or ""); rL:SetRelativeWidth(0.1); row:AddChild(rL)
-    local iL = AceGUI:Create("Label"); iL:SetText(data.ilvl or "");    iL:SetRelativeWidth(0.08); row:AddChild(iL)
-    local sL = AceGUI:Create("Label"); sL:SetText(data.status or "");  sL:SetRelativeWidth(0.18); row:AddChild(sL)
-    local cL = AceGUI:Create("Label"); cL:SetText(tostring(#msgs));    cL:SetRelativeWidth(0.08); row:AddChild(cL)
-    local tL = AceGUI:Create("Label"); tL:SetText(lastTs);             tL:SetRelativeWidth(0.20); row:AddChild(tL)
-
-    -- smaller, stable options control on the right
-    local opt = AceGUI:Create("InteractiveLabel")
-    opt:SetText("|cffbbbbbb...|r")
-    opt:SetRelativeWidth(0.06)
-    if opt.SetJustifyH then opt:SetJustifyH("RIGHT") end
-    opt:SetCallback("OnClick", function(widget) showHistoryContext(name, widget) end)
-    opt:SetCallback("OnEnter", function(widget)
-      GameTooltip:SetOwner(widget.frame, "ANCHOR_RIGHT")
-      GameTooltip:SetText("Options", 1,1,1)
-      GameTooltip:Show()
-    end)
-    opt:SetCallback("OnLeave", function()
-      GameTooltip:Hide()
-    end)
-    row:AddChild(opt)
-  end
-end
-
--- ==============================
--- Tabs: Excluded
--- ==============================
-local function showExcludedOptions(name)
-  local data = MyRaidAddon.db.profile.invitedPlayers[name]
-  local frame = AceGUI:Create("Window")
-  frame:SetTitle("Excluded Player")
-  frame:SetLayout("List")
-  frame:SetWidth(360); frame:SetHeight(320)
-  frame:SetCallback("OnClose", function(w) AceGUI:Release(w) end)
-
-  local info = AceGUI:Create("Label")
-  info:SetFullWidth(true)
-  local ilvl = data and (data.ilvl or "-") or "-"
-  local lastRole = data and (data.lastRole or "-") or "-"
-  info:SetText(string.format("%s\nLast Role: %s\nilvl: %s\nStatus: Excluded", name, lastRole, ilvl))
-  frame:AddChild(info)
-
-  local viewChat = AceGUI:Create("Button"); viewChat:SetText("View Whisper Log"); viewChat:SetWidth(200)
-  viewChat:SetCallback("OnClick", function() frame:Hide(); showWhisperDetail(name) end)
-  frame:AddChild(viewChat)
-
-  local removeEx = AceGUI:Create("Button"); removeEx:SetText("Remove Exclusion"); removeEx:SetWidth(200)
-  removeEx:SetCallback("OnClick", function()
-    if data then data.status = "request" end
-    updatePlayersWithoutRole(); updatePlayerStatuses()
-    frame:Hide(); RebuildActiveTab()
-  end)
-  frame:AddChild(removeEx)
-
-  local purge = AceGUI:Create("Button"); purge:SetText("Delete From DB"); purge:SetWidth(200)
-  purge:SetCallback("OnClick", function()
-    MyRaidAddon.db.profile.invitedPlayers[name] = nil
-    frame:Hide(); RebuildActiveTab()
-  end)
-  frame:AddChild(purge)
-end
-
-local function buildExcludedTab(container)
-  container:ReleaseChildren()
-  local scroll = AceGUI:Create("ScrollFrame"); scroll:SetLayout("Flow"); scroll:SetFullWidth(true); scroll:SetFullHeight(true); container:AddChild(scroll)
-
-  local db = MyRaidAddon.db.profile.invitedPlayers
-  local header = AceGUI:Create("SimpleGroup"); header:SetFullWidth(true); header:SetLayout("Flow"); scroll:AddChild(header)
-  local function H(t,rel) local l=AceGUI:Create("Label"); l:SetText(t); l:SetRelativeWidth(rel); header:AddChild(l) end
-  H("Name",0.4); H("Last Role",0.2); H("ilvl",0.15); H("Status",0.15); H("Actions",0.1)
-
-  local keys = {}
-  for k,v in pairs(db) do if v and v.status == "Excluded" then table.insert(keys, k) end end
-  table.sort(keys)
-
-  for _, name in ipairs(keys) do
-    local data = db[name]
-    local row = AceGUI:Create("SimpleGroup"); row:SetFullWidth(true); row:SetLayout("Flow"); scroll:AddChild(row)
-    local display = "|c"..getClassColorCode(name)..name.."|r"
-    local nL = AceGUI:Create("InteractiveLabel"); nL:SetText(display); nL:SetRelativeWidth(0.4); row:AddChild(nL)
-    nL:SetCallback("OnClick", function(_, _, button)
-      if IsShiftKeyDown() then
-        doWhoQuery(name)
-      else
-        showExcludedOptions(name)
-      end
-    end)
-    local rL = AceGUI:Create("Label"); rL:SetText(data.lastRole or ""); rL:SetRelativeWidth(0.2); row:AddChild(rL)
-    local iL = AceGUI:Create("Label"); iL:SetText(data.ilvl or "");    iL:SetRelativeWidth(0.15);  row:AddChild(iL)
-    local sL = AceGUI:Create("Label"); sL:SetText("Excluded");         sL:SetRelativeWidth(0.15);  row:AddChild(sL)
-    local opt = AceGUI:Create("Button"); opt:SetText("Options"); opt:SetRelativeWidth(0.1); opt:SetCallback("OnClick", function() showExcludedOptions(name) end); row:AddChild(opt)
-  end
-
-  if #keys==0 then
-    local none = AceGUI:Create("Label"); none:SetText("No excluded players."); none:SetFullWidth(true); scroll:AddChild(none)
-  end
 end
 
 -- ==============================
@@ -2631,16 +3337,55 @@ local function buildSortRulesTab(container)
   container:AddChild(wrap)
 
   local info = AceGUI:Create("Label"); info:SetFullWidth(true)
-  info:SetText("|cff88ccffSort Rules+|r — define class/role quotas with operators (>=, <=, >, <, =, !=) and hints: 'avoid X', 'require Y', 'wants=Tag', 'prefer=A,B,C'. You can add 'Global=' lines.")
+  info:SetText([[|cff88ccffSort Rules+ Handbook|r
+Use this editor to shape the auto sorter.
+- Begin each section with "Grp=#" (1-8); optional "GrpType=Label" is informational.
+- Keys per group: wants=, require=, avoid=, prefer=, fill=, definition=. Operators: =, !=, <, <=, >, >=.
+- Role keywords: Tank, Healer, Melee, Range. Class keys accept names or "Class(Spec)" (for example Priest(Shadow)).
+- prefer= sets priority order; fill= marks fallback roles the filler step may add.
+- Global rules (e.g. "Global=HealerInMelee<=1; ShamanPerMeleeGrp>=1") impose raid-wide constraints.
+- Lines starting with # are comments. The default template below already mirrors the 40-player layout.
+]])
   wrap:AddChild(info)
 
-  local edit = AceGUI:Create("MultiLineEditBox")
+  local presetRow = AceGUI:Create("SimpleGroup"); presetRow:SetLayout("Flow"); presetRow:SetFullWidth(true); wrap:AddChild(presetRow)
+
+  local presetLabel = AceGUI:Create("Label"); presetLabel:SetText("Load preset:"); presetLabel:SetWidth(120); presetRow:AddChild(presetLabel)
+
+  local presetDropdown = AceGUI:Create("Dropdown"); presetDropdown:SetWidth(220); presetDropdown:SetLabel("")
+  local presetMap = {
+    ten    = { label = "10-Man (2 groups)", text = SORT_TEMPLATE_10 },
+    twenty = { label = "20-Man (4 groups)", text = SORT_TEMPLATE_20 },
+    forty  = { label = "40-Man (8 groups)", text = SORT_TEMPLATE_40 },
+  }
+  local presetList = {}
+  local presetOrder = {"ten","twenty","forty"}
+  for _, key in ipairs(presetOrder) do
+    local data = presetMap[key]
+    if data then presetList[key] = data.label end
+  end
+  presetDropdown:SetList(presetList); presetDropdown:SetValue(nil)
+  presetRow:AddChild(presetDropdown)
+
+  local presetHint = AceGUI:Create("Label"); presetHint:SetText("|cffaaaaaaSelecting a preset replaces the editor below (changes not saved until you press Save).|r"); presetHint:SetFullWidth(true); wrap:AddChild(presetHint)
+
+  local edit, status
+
+  presetDropdown:SetCallback("OnValueChanged", function(_,_,key)
+    local entry = presetMap[key]
+    if not entry then return end
+    if edit then edit:SetText(entry.text or "") end
+    if status then status:SetText("|cff55ff55Loaded preset: "..entry.label.." (not saved yet).|r") end
+    presetDropdown:SetValue(nil)
+  end)
+
+  edit = AceGUI:Create("MultiLineEditBox")
   edit:SetLabel("Sort Rules Text")
   edit:SetFullWidth(true); edit:SetNumLines(18)
   edit:SetText(MyRaidAddon.db.profile.sortRulesText or DEFAULT_SORT_TEXT)
   wrap:AddChild(edit)
 
-  local status = AceGUI:Create("Label"); status:SetFullWidth(true); status:SetText(""); wrap:AddChild(status)
+  status = AceGUI:Create("Label"); status:SetFullWidth(true); status:SetText(""); wrap:AddChild(status)
 
   local btnRow = AceGUI:Create("SimpleGroup"); btnRow:SetLayout("Flow"); btnRow:SetFullWidth(true); wrap:AddChild(btnRow)
 
@@ -2677,7 +3422,6 @@ end
 local tabs = {
   {text="Main",          value="main"},
   {text="Roles",         value="roles"},
-  {text="Excluded",      value="excluded"},
   {text="History",       value="history"},
   {text="Whisper Rules", value="rules"},
   {text="Sort Rules",    value="sortrules"},
@@ -2689,25 +3433,83 @@ local function SelectTab(container, _, group)
   if     group=="main"     then buildMainTab(container)
   elseif group=="roles"    then buildRolesTab(container)
   elseif group=="history"  then buildHistoryTab(container)
-  elseif group=="excluded" then buildExcludedTab(container)
+
   elseif group=="rules"    then buildRulesTab(container)
   elseif group=="sortrules"then buildSortRulesTab(container)
   else buildMainTab(container) end
 end
 
--- Adjust the split between the history table (top) and the whisper viewer (bottom)
+-- Adjust the split between Excluded, Recent, and Whisper viewer
 function MyRaidAddon:AdjustHistoryHeights()
   if not tabGroup or not tabGroup.GetSelected or tabGroup:GetSelected() ~= "history" then return end
-  local scroll = self._historyScroll
-  local view   = self._historyViewBox
-  if not scroll or not view then return end
-  local parentH = (tabGroup and tabGroup.frame and tabGroup.frame:GetHeight()) or (mainFrame and mainFrame.frame and mainFrame.frame:GetHeight()) or 700
-  local topH = math.floor(parentH * 0.58)
-  local botH = math.floor(parentH * 0.26)
-  if topH < 160 then topH = 160 end
-  if botH < 100 then botH = 100 end
-  scroll:SetHeight(topH)
-  view:SetHeight(botH)
+
+  if self.db and self.db.profile and self.db.profile.historyShowGroup then
+    local listBox = self._groupHistoryListBox
+    local detailBox = self._groupHistoryDetailBox
+    local listScroll = self._groupHistoryList
+    local detailScroll = self._groupHistoryDetail
+    if not listBox or not detailBox then return end
+
+    local parentH = (tabGroup and tabGroup.content and tabGroup.content.GetHeight and tabGroup.content:GetHeight())
+                    or (tabGroup and tabGroup.frame and tabGroup.frame:GetHeight())
+                    or (mainFrame and mainFrame.frame and mainFrame.frame:GetHeight())
+                    or 700
+    local toggleRow = self._historyToggleRow
+    if toggleRow and toggleRow.frame and toggleRow.frame:GetHeight() then
+      parentH = parentH - toggleRow.frame:GetHeight() - 20
+    end
+    if parentH < 200 then parentH = 200 end
+
+    listBox:SetHeight(parentH)
+    detailBox:SetHeight(parentH)
+
+    local innerH = parentH - 32
+    if innerH < 120 then innerH = 120 end
+    if listScroll then
+      if listScroll.SetHeight then listScroll:SetHeight(innerH)
+      elseif listScroll.frame and listScroll.frame.SetHeight then listScroll.frame:SetHeight(innerH) end
+    end
+    if detailScroll then
+      if detailScroll.SetHeight then detailScroll:SetHeight(innerH)
+      elseif detailScroll.frame and detailScroll.frame.SetHeight then detailScroll.frame:SetHeight(innerH) end
+    end
+    return
+  end
+
+  local excl   = self._histExcluded
+  local recent = self._histRecent
+  local viewBox= self._historyViewBox
+  if not excl or not recent or not viewBox then return end
+
+  -- Keep top & bottom sized as before, let the middle absorb remaining space so
+  -- Whisper Text stays anchored at the bottom with no trailing gap.
+  local parentH = (tabGroup and tabGroup.content and tabGroup.content.GetHeight and tabGroup.content:GetHeight())
+                  or (tabGroup and tabGroup.frame and tabGroup.frame:GetHeight())
+                  or (mainFrame and mainFrame.frame and mainFrame.frame:GetHeight())
+                  or 700
+
+  local minTop, minMid, minBot = 100, 140, 100
+  local hTop = math.floor(parentH * 0.22)
+  local hBot = math.floor(parentH * 0.24)
+  if hTop < minTop then hTop = minTop end
+  if hBot < minBot then hBot = minBot end
+
+  local hMid = parentH - hTop - hBot
+  if hMid < minMid then
+    local need = minMid - hMid
+    local reduceTop = math.min(math.floor(need/2), math.max(0, hTop - minTop))
+    local reduceBot = math.min(need - reduceTop, math.max(0, hBot - minBot))
+    hTop = hTop - reduceTop
+    hBot = hBot - reduceBot
+    hMid = parentH - hTop - hBot
+    if hMid < minMid then hMid = minMid end
+  end
+
+  if hMid < 0 then hMid = minMid end
+
+  excl:SetHeight(hTop)
+  recent:SetHeight(hMid)
+  viewBox:SetHeight(hBot)
 end
 
 function MyRaidAddon:CreateMainWindow()
@@ -2790,7 +3592,9 @@ local function onRosterUpdate()
     end
   end
 
-  -- 2) Zurück in aktive Rollen nehmen, wenn (wieder) in Gruppe und online, basierend auf gespeicherter Rolle
+  -- 2) Zurück in aktive Rollen nehmen, wenn (wieder) in Gruppe und online
+  --    a) Wenn gespeicherte Rolle vorhanden → wiederherstellen
+  --    b) Falls keine gespeicherte Rolle: für eindeutige Klassen (Mage/Warlock/Hunter/Rogue) automatisch Rollen zuweisen
   local ra = MyRaidAddon.db.profile.roleAssignments or {}
   for name, unit in pairs(unitByName) do
     if isOnline[name] and not inAnyActiveList(name) then
@@ -2798,6 +3602,12 @@ local function onRosterUpdate()
       if role and canAddToRole(role) then
         PersistAddToActive(role, name)
         MyRaidAddon:AddToInvitedPlayers(name, role, "active")
+      else
+        local defRole = inferDefaultRoleByClass(name)
+        if defRole and canAddToRole(defRole) then
+          PersistAddToActive(defRole, name)
+          MyRaidAddon:AddToInvitedPlayers(name, defRole, "active")
+        end
       end
     end
   end
@@ -2844,13 +3654,16 @@ function MyRaidAddon:OnInitialize()
       invitedPlayers    = {},
       selectedRaid      = selectedRaid,
       whisperHistory    = {},
+      groupHistory      = {},
       aiRulesText       = DEFAULT_AI_TEXT,
       aiRulesParsed     = nil,
       sortRulesText     = DEFAULT_SORT_TEXT,
+      sortRulesVersion  = SORT_RULES_TEMPLATE_VERSION,
       activeRoles       = { tank={}, healer={}, range={}, melee={} },
       roleAssignments   = {},
       historySortKey    = "last",
       historySortAsc    = false,
+      historyShowGroup  = false,
       srLink            = "",
       discordLink       = "",
       raidWarnEnabled   = false,
@@ -2860,6 +3673,7 @@ function MyRaidAddon:OnInitialize()
   -- sane defaults / refs
   self.db.profile.invitedPlayers   = self.db.profile.invitedPlayers   or {}
   self.db.profile.whisperHistory   = self.db.profile.whisperHistory   or {}
+  self.db.profile.groupHistory     = self.db.profile.groupHistory     or {}
   self.db.profile.selectedChannels = self.db.profile.selectedChannels or {}
   self.db.profile.activeRoles      = self.db.profile.activeRoles      or { tank={}, healer={}, range={}, melee={} }
   self.db.profile.roleAssignments  = self.db.profile.roleAssignments  or {}
@@ -2879,6 +3693,13 @@ function MyRaidAddon:OnInitialize()
   if type(self.db.profile.sortRulesText) ~= "string" or self.db.profile.sortRulesText == "" then
     self.db.profile.sortRulesText = DEFAULT_SORT_TEXT
   end
+  local storedSortVersion = tonumber(self.db.profile.sortRulesVersion or 0)
+  if storedSortVersion < SORT_RULES_TEMPLATE_VERSION then
+    if not self.db.profile.sortRulesText or self.db.profile.sortRulesText == "" or self.db.profile.sortRulesText == LEGACY_SORT_TEXT_V1 then
+      self.db.profile.sortRulesText = DEFAULT_SORT_TEXT
+    end
+    self.db.profile.sortRulesVersion = SORT_RULES_TEMPLATE_VERSION
+  end
 
   -- Lade persistente Rollen in die Runtime-Listen
   LoadActiveRolesFromDB()
@@ -2890,6 +3711,8 @@ function MyRaidAddon:OnInitialize()
 
   self:RegisterChatCommand("myraidaddon", "CreateMainWindow")
   self:RegisterChatCommand("lfm", function() postRaid(selectedRaid) end)
+  self:RegisterChatCommand("link", function() postLinks() end)
+  self:RegisterChatCommand("links", function() postLinks() end)
 
   -- Events
   self:RegisterEvent("CHAT_MSG_WHISPER", onWhisper)
@@ -2897,6 +3720,7 @@ function MyRaidAddon:OnInitialize()
   self:RegisterEvent("GROUP_ROSTER_UPDATE", onRosterUpdate)
   self:RegisterEvent("PLAYER_ENTERING_WORLD", onRosterUpdate)
   self:RegisterEvent("INSPECT_READY", onInspectReady)
+  self:RegisterEvent("ENCOUNTER_END", onEncounterEnd)
   -- Reagiere auch auf Online/Offline Wechsel von Gruppeneinheiten
   self:RegisterEvent("UNIT_CONNECTION", function() onRosterUpdate() end)
 
@@ -2932,10 +3756,206 @@ end
 
 
 
+local function formatGroupHistoryResult(entry)
+  if entry.success == nil then return "|cffffff00Pending|r" end
+  if entry.success then return "|cff55ff55Kill|r" end
+  return "|cffff5555Wipe|r"
+end
 
+local function roleKeyToLabel(roleKey, combatRole)
+  if roleKey == "tank" then return "Tank" end
+  if roleKey == "healer" then return "Healer" end
+  if roleKey == "melee" then return "Melee DPS" end
+  if roleKey == "range" then return "Range DPS" end
+  if combatRole == "TANK" then return "Tank" end
+  if combatRole == "HEALER" then return "Healer" end
+  if combatRole == "DAMAGER" then return "DPS" end
+  return ""
+end
 
+local function colorizeClassName(name, classToken)
+  if classToken and RAID_CLASS_COLORS and RAID_CLASS_COLORS[classToken] then
+    local c = RAID_CLASS_COLORS[classToken]
+    return string.format("|cff%02x%02x%02x%s|r", c.r * 255, c.g * 255, c.b * 255, name)
+  end
+  return name
+end
 
+refreshGroupHistoryView = function(selectIndex)
+  local history = ensureGroupHistory()
+  local maxEntries = #history
+  if type(selectIndex) == "number" then
+    if selectIndex >= 1 and selectIndex <= maxEntries then
+      MyRaidAddon._groupHistorySelectedIndex = selectIndex
+    end
+  elseif selectIndex == "reset" then
+    MyRaidAddon._groupHistorySelectedIndex = (maxEntries > 0) and 1 or nil
+  end
 
+  if maxEntries == 0 then
+    MyRaidAddon._groupHistorySelectedIndex = nil
+  else
+    local sel = MyRaidAddon._groupHistorySelectedIndex or 1
+    if sel < 1 then sel = 1 end
+    if sel > maxEntries then sel = maxEntries end
+    MyRaidAddon._groupHistorySelectedIndex = sel
+  end
 
+  local selIndex = MyRaidAddon._groupHistorySelectedIndex or 1
+  local listScroll = MyRaidAddon._groupHistoryList
+  if listScroll then
+    listScroll:ReleaseChildren()
+    if maxEntries == 0 then
+      local none = AceGUI:Create("Label")
+      none:SetText("No group or raid snapshots recorded yet.")
+      none:SetFullWidth(true)
+      listScroll:AddChild(none)
+    else
+      for idx, entry in ipairs(history) do
+        local ts = entry.timestamp and date("%Y-%m-%d %H:%M", entry.timestamp) or "Unknown time"
+        local inst = entry.instanceName or "Unknown instance"
+        local idText = entry.lockId or (entry.mapID and ("map "..entry.mapID)) or "-"
+        local encounter = entry.encounterName or (entry.reason == "ENCOUNTER_END" and "Encounter") or "-"
+        local diff = entry.difficultyName and ("("..entry.difficultyName..")") or ""
+        local size = entry.raidSize or (entry.roster and #entry.roster) or 0
+        local resultText = formatGroupHistoryResult(entry)
+        local line = string.format(
+          "%s  %s (ID %s)  %s %s  %s  |cffbbbbbb[%d players]|r",
+          ts, inst, idText, encounter, diff, resultText, size
+        )
+        local row = AceGUI:Create("InteractiveLabel")
+        row:SetText(line)
+        row:SetFullWidth(true)
+        if row.SetHighlight then row:SetHighlight(idx == selIndex) end
+        row:SetCallback("OnClick", function()
+          MyRaidAddon._groupHistorySelectedIndex = idx
+          refreshGroupHistoryView()
+        end)
+        listScroll:AddChild(row)
+      end
+    end
+  end
 
+  local detailScroll = MyRaidAddon._groupHistoryDetail
+  if detailScroll then
+    detailScroll:ReleaseChildren()
+    if maxEntries == 0 then
+      local none = AceGUI:Create("Label")
+      none:SetText("No roster data available yet.")
+      none:SetFullWidth(true)
+      detailScroll:AddChild(none)
+      return
+    end
 
+    local entry = history[selIndex]
+    if not entry then
+      local none = AceGUI:Create("Label")
+      none:SetText("No roster data available yet.")
+      none:SetFullWidth(true)
+      detailScroll:AddChild(none)
+      return
+    end
+
+    local metaParts = {}
+    table.insert(metaParts, string.format("|cff88ccffInstance:|r %s", entry.instanceName or "-"))
+    table.insert(metaParts, string.format("|cff88ccffRaid/Party ID:|r %s", entry.lockId or (entry.mapID and ("map "..entry.mapID)) or "-"))
+    if entry.encounterName then
+      table.insert(metaParts, string.format("|cff88ccffEncounter:|r %s", entry.encounterName))
+    end
+    if entry.difficultyName then
+      table.insert(metaParts, string.format("|cff88ccffDifficulty:|r %s", entry.difficultyName))
+    end
+    local size = entry.raidSize or (entry.roster and #entry.roster) or 0
+    table.insert(metaParts, string.format("|cff88ccffGroup Size:|r %d", size))
+    local ilvlStats = entry.ilvlStats or {}
+    if ilvlStats.total and ilvlStats.total > 0 then
+      table.insert(metaParts, string.format("|cff88ccffilvl:|r total %d | average %d (n=%d)", ilvlStats.total, ilvlStats.average or 0, ilvlStats.count or 0))
+    elseif ilvlStats.average then
+      table.insert(metaParts, string.format("|cff88ccffAverage ilvl:|r %d (n=%d)", ilvlStats.average, ilvlStats.count or 0))
+    end
+    local rs = entry.roleSummary or {}
+    local tCount = rs.tank or 0
+    local hCount = rs.healer or 0
+    local mCount = rs.melee or 0
+    local rCount = rs.range or 0
+    local compLine = string.format("%dT %dH %dM %dR", tCount, hCount, mCount, rCount)
+    if (rs.other or 0) > 0 then
+      compLine = compLine .. string.format(" (+%d other)", rs.other)
+    end
+    table.insert(metaParts, "|cff88ccffComposition:|r "..compLine)
+    table.insert(metaParts, "|cff88ccffResult:|r "..formatGroupHistoryResult(entry))
+
+    local meta = AceGUI:Create("Label")
+    meta:SetFullWidth(true)
+    meta:SetText(table.concat(metaParts, "\n"))
+    detailScroll:AddChild(meta)
+
+    local spacer = AceGUI:Create("Label")
+    spacer:SetFullWidth(true)
+    spacer:SetText(" ")
+    detailScroll:AddChild(spacer)
+
+    local header = AceGUI:Create("SimpleGroup")
+    header:SetLayout("Flow")
+    header:SetFullWidth(true)
+    local function addHeader(text, rel)
+      local lbl = AceGUI:Create("Label")
+      lbl:SetText(text)
+      lbl:SetRelativeWidth(rel)
+      header:AddChild(lbl)
+    end
+    addHeader("Name", 0.38)
+    addHeader("Role", 0.18)
+    addHeader("ilvl", 0.12)
+    addHeader("Level", 0.10)
+    addHeader("Group", 0.08)
+    addHeader("Status", 0.14)
+    detailScroll:AddChild(header)
+
+    for _, member in ipairs(entry.roster or {}) do
+      local row = AceGUI:Create("SimpleGroup")
+      row:SetLayout("Flow")
+      row:SetFullWidth(true)
+
+      local nameLbl = AceGUI:Create("Label")
+      nameLbl:SetText(colorizeClassName(member.shortName or member.name, member.classToken))
+      nameLbl:SetRelativeWidth(0.38)
+      row:AddChild(nameLbl)
+
+      local roleLbl = AceGUI:Create("Label")
+      roleLbl:SetText(roleKeyToLabel(member.roleKey, member.combatRole))
+      roleLbl:SetRelativeWidth(0.18)
+      row:AddChild(roleLbl)
+
+      local ilLbl = AceGUI:Create("Label")
+      ilLbl:SetText(member.ilvl and tostring(member.ilvl) or "-")
+      ilLbl:SetRelativeWidth(0.12)
+      row:AddChild(ilLbl)
+
+      local lvlLbl = AceGUI:Create("Label")
+      lvlLbl:SetText(member.level and tostring(member.level) or "-")
+      lvlLbl:SetRelativeWidth(0.10)
+      row:AddChild(lvlLbl)
+
+      local grpLbl = AceGUI:Create("Label")
+      grpLbl:SetText(member.subgroup and tostring(member.subgroup) or "-")
+      grpLbl:SetRelativeWidth(0.08)
+      row:AddChild(grpLbl)
+
+      local statusLbl = AceGUI:Create("Label")
+      local statusText
+      if not member.online then
+        statusText = "|cffff5555Offline|r"
+      elseif member.isDead then
+        statusText = "|cffffaa00Dead|r"
+      else
+        statusText = "|cff55ff55Online|r"
+      end
+      statusLbl:SetText(statusText)
+      statusLbl:SetRelativeWidth(0.14)
+      row:AddChild(statusLbl)
+
+      detailScroll:AddChild(row)
+    end
+  end
+end
