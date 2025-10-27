@@ -16,6 +16,8 @@ local AceGUI   = LibStub("AceGUI-3.0")
 local AceDB    = LibStub("AceDB-3.0")
 
 local refreshGroupHistoryView
+local colorizeClassName
+local roleKeyToLabel
 
 -- defensive stub
 function MyRaidAddon:UpdateRoleManagementPage() end
@@ -930,11 +932,9 @@ local function recordGroupHistoryEntry(entry)
   local history = ensureGroupHistory()
   table.insert(history, 1, entry)
   while #history > GROUP_HISTORY_MAX do table.remove(history) end
-  if not MyRaidAddon._groupHistorySelectedIndex or MyRaidAddon._groupHistorySelectedIndex < 1 then
-    MyRaidAddon._groupHistorySelectedIndex = 1
-  end
   if refreshGroupHistoryView then refreshGroupHistoryView() end
 end
+
 
 local function collectRosterSnapshot()
   local roster = {}
@@ -942,6 +942,8 @@ local function collectRosterSnapshot()
   local totalIlvl, countIlvl = 0, 0
   local assignments = (MyRaidAddon.db and MyRaidAddon.db.profile and MyRaidAddon.db.profile.roleAssignments) or {}
   local invited = (MyRaidAddon.db and MyRaidAddon.db.profile and MyRaidAddon.db.profile.invitedPlayers) or {}
+  local rangedClasses = { MAGE=true, WARLOCK=true, HUNTER=true, PRIEST=true }
+  local meleeClasses  = { ROGUE=true, WARRIOR=true }
 
   local function takeIlvl(value)
     local v = tonumber(value)
@@ -953,11 +955,30 @@ local function collectRosterSnapshot()
     return nil
   end
 
-  local function resolveRole(fullName, combatRole, unitToken)
+  local function normalizeRoleKey(roleKey, classToken, fullName)
+    if type(roleKey) ~= "string" or roleKey == "" then return nil end
+    local rk = roleKey:lower()
+    if rk == "tank" or rk == "healer" or rk == "melee" or rk == "range" then return rk end
+    if rk == "dps" or rk == "damage" or rk == "damager" then
+      local classUpper = classToken and classToken:upper() or ""
+      if rangedClasses[classUpper] then return "range" end
+      if meleeClasses[classUpper] then return "melee" end
+      if inferDefaultRoleByClass then
+        local inferred = inferDefaultRoleByClass(fullName)
+        if inferred == "range" or inferred == "melee" then return inferred end
+      end
+      return "melee"
+    end
+    return rk
+  end
+
+  local function resolveRole(fullName, combatRole, unitToken, classToken)
     local role = assignments[fullName]
-    if role and role ~= "" then return role end
+    if role and role ~= "" then return normalizeRoleKey(role, classToken, fullName) end
     local rec = invited[fullName]
-    if rec and rec.lastRole and rec.lastRole ~= "" then return rec.lastRole end
+    if rec and rec.lastRole and rec.lastRole ~= "" then
+      return normalizeRoleKey(rec.lastRole, classToken or (rec.class and rec.class:upper()), fullName)
+    end
     if combatRole == "TANK" then return "tank" end
     if combatRole == "HEALER" then return "healer" end
     if combatRole == "DAMAGER" then
@@ -967,7 +988,7 @@ local function collectRosterSnapshot()
     end
     if inferDefaultRoleByClass then
       local fallback = inferDefaultRoleByClass(fullName)
-      if fallback and fallback ~= "" then return fallback end
+      if fallback and fallback ~= "" then return normalizeRoleKey(fallback, classToken, fullName) end
     end
     return nil
   end
@@ -996,8 +1017,10 @@ local function collectRosterSnapshot()
         local unitToken = "raid"..i
         local rec = invited[full]
         local ilvl = playerItemLevels[full] or (rec and rec.ilvl) or nil
-        local roleKey = resolveRole(full, combatRole, unitToken)
-        if not roleKey and combatRole == "DAMAGER" and rec and rec.lastRole then roleKey = rec.lastRole end
+        local roleKey = resolveRole(full, combatRole, unitToken, classFile)
+        if not roleKey and combatRole == "DAMAGER" and rec and rec.lastRole then
+          roleKey = normalizeRoleKey(rec.lastRole, classFile, full)
+        end
         push({
           name = full,
           shortName = name,
@@ -1028,8 +1051,10 @@ local function collectRosterSnapshot()
       local combatRole = UnitGroupRolesAssigned and UnitGroupRolesAssigned(unitToken) or nil
       local rec = invited[full]
       local ilvl = playerItemLevels[full] or (rec and rec.ilvl) or nil
-      local roleKey = resolveRole(full, combatRole, unitToken)
-      if not roleKey and combatRole == "DAMAGER" and rec and rec.lastRole then roleKey = rec.lastRole end
+      local roleKey = resolveRole(full, combatRole, unitToken, classToken)
+      if not roleKey and combatRole == "DAMAGER" and rec and rec.lastRole then
+        roleKey = normalizeRoleKey(rec.lastRole, classToken, full)
+      end
       push({
         name = full,
         shortName = short,
@@ -1097,7 +1122,6 @@ local function captureGroupSnapshot(meta)
     ilvlStats      = ilvlStats,
   }
 
-  MyRaidAddon._groupHistorySelectedIndex = 1
   recordGroupHistoryEntry(entry)
 end
 
@@ -3126,132 +3150,60 @@ end
 
 local function buildHistoryTab(container)
   container:ReleaseChildren()
-  local root = AceGUI:Create("SimpleGroup"); root:SetLayout("Flow"); root:SetFullWidth(true); root:SetFullHeight(true); container:AddChild(root)
 
-  local showGroup = MyRaidAddon.db.profile.historyShowGroup and true or false
+  local root = AceGUI:Create("SimpleGroup")
+  root:SetLayout("Fill")
+  root:SetFullWidth(true)
+  root:SetFullHeight(true)
+  container:AddChild(root)
 
-  local toggleRow = AceGUI:Create("SimpleGroup"); toggleRow:SetLayout("Flow"); toggleRow:SetFullWidth(true); root:AddChild(toggleRow)
-  MyRaidAddon._historyToggleRow = toggleRow
-  local toggle = AceGUI:Create("CheckBox"); toggle:SetLabel("Show Group/Raid History"); toggle:SetValue(showGroup); toggle:SetWidth(220)
-  toggle:SetCallback("OnValueChanged", function(_,_,val)
-    MyRaidAddon.db.profile.historyShowGroup = val and true or false
-    buildHistoryTab(container)
-  end)
-  toggleRow:AddChild(toggle)
-  local hint = AceGUI:Create("Label"); hint:SetText("|cffaaaaaaToggle between whisper history and recorded raid/instance rosters.|r"); hint:SetRelativeWidth(0.7); toggleRow:AddChild(hint)
+  local wrap = AceGUI:Create("SimpleGroup")
+  wrap:SetLayout("List")
+  wrap:SetFullWidth(true)
+  wrap:SetFullHeight(true)
+  root:AddChild(wrap)
 
-  if showGroup then
-    MyRaidAddon._histExcluded = nil
-    MyRaidAddon._histRecent = nil
-    MyRaidAddon._historyViewBox = nil
-    MyRaidAddon._historyViewScroll = nil
-    MyRaidAddon._groupHistoryWrap = nil
-    MyRaidAddon._groupHistoryListBox = nil
-    MyRaidAddon._groupHistoryDetailBox = nil
+  local title = AceGUI:Create("Label")
+  title:SetFullWidth(true)
+  title:SetText(string.format("|cff88ccffRaid History|r (max %d entries)", GROUP_HISTORY_MAX))
+  wrap:AddChild(title)
 
-    local wrap = AceGUI:Create("SimpleGroup"); wrap:SetLayout("Flow"); wrap:SetFullWidth(true); wrap:SetFullHeight(true); root:AddChild(wrap)
+  local header = AceGUI:Create("SimpleGroup")
+  header:SetLayout("Flow")
+  header:SetFullWidth(true)
+  wrap:AddChild(header)
 
-    local listBox = AceGUI:Create("InlineGroup"); listBox:SetTitle(string.format("Group History (max %d)", GROUP_HISTORY_MAX)); listBox:SetLayout("Fill"); listBox:SetRelativeWidth(0.42); listBox:SetFullHeight(true); wrap:AddChild(listBox)
-    local listScroll = AceGUI:Create("ScrollFrame"); listScroll:SetLayout("Flow"); listScroll:SetFullWidth(true); listScroll:SetFullHeight(true); listBox:AddChild(listScroll)
-
-    local detailBox = AceGUI:Create("InlineGroup"); detailBox:SetTitle("Roster & ilvl Details"); detailBox:SetLayout("Fill"); detailBox:SetRelativeWidth(0.58); detailBox:SetFullHeight(true); wrap:AddChild(detailBox)
-    local detailScroll = AceGUI:Create("ScrollFrame"); detailScroll:SetLayout("List"); detailScroll:SetFullWidth(true); detailScroll:SetFullHeight(true); detailBox:AddChild(detailScroll)
-
-    MyRaidAddon._groupHistoryList = listScroll
-    MyRaidAddon._groupHistoryDetail = detailScroll
-    MyRaidAddon._groupHistoryWrap = wrap
-    MyRaidAddon._groupHistoryListBox = listBox
-    MyRaidAddon._groupHistoryDetailBox = detailBox
-
-    refreshGroupHistoryView("reset")
-    if MyRaidAddon.AdjustHistoryHeights then MyRaidAddon:AdjustHistoryHeights() end
-    return
+  local function addHeader(text, relWidth)
+    local lbl = AceGUI:Create("Label")
+    lbl:SetText(text)
+    lbl:SetRelativeWidth(relWidth)
+    header:AddChild(lbl)
   end
 
-  MyRaidAddon._groupHistoryList = nil
-  MyRaidAddon._groupHistoryDetail = nil
-  MyRaidAddon._groupHistoryWrap = nil
-  MyRaidAddon._groupHistoryListBox = nil
-  MyRaidAddon._groupHistoryDetailBox = nil
+  addHeader("Timestamp", 0.18)
+  addHeader("Instance", 0.25)
+  addHeader("Encounter / Reason", 0.25)
+  addHeader("Result", 0.10)
+  addHeader("Size", 0.08)
+  addHeader("ilvl / Roles", 0.14)
 
-  local db = MyRaidAddon.db.profile.invitedPlayers
-  local store = ensureWhisperStore()
-  local exclBox = AceGUI:Create("InlineGroup"); exclBox:SetTitle("Excluded"); exclBox:SetFullWidth(true); exclBox:SetLayout("Fill"); root:AddChild(exclBox)
-  local exclScroll = AceGUI:Create("ScrollFrame"); exclScroll:SetLayout("Flow"); exclBox:AddChild(exclScroll)
-  do
-    local header = AceGUI:Create("SimpleGroup"); header:SetFullWidth(true); header:SetLayout("Flow"); exclScroll:AddChild(header)
-    local function H(t,rel) local l=AceGUI:Create("Label"); l:SetText(t); l:SetRelativeWidth(rel); header:AddChild(l) end
-    H("Name",0.4); H("Last Role",0.2); H("ilvl",0.15); H("Status",0.15); H(" ",0.1)
-    local keys = {}
-    for k,v in pairs(db) do if v and v.status=="Excluded" then table.insert(keys, k) end end
-    table.sort(keys)
-    for _,name in ipairs(keys) do
-      local data = db[name] or {}
-      local row = AceGUI:Create("SimpleGroup"); row:SetFullWidth(true); row:SetLayout("Flow"); exclScroll:AddChild(row)
-      local display = "|c"..getClassColorCode(name)..name.."|r"
-      local nL = AceGUI:Create("InteractiveLabel"); nL:SetText(display); nL:SetRelativeWidth(0.4); row:AddChild(nL)
-      nL:SetCallback("OnClick", function(widget) MyRaidAddon:OpenAssignWindow(name, widget and widget.frame) end)
-      local rL = AceGUI:Create("Label"); rL:SetText((data.lastRole or "")); rL:SetRelativeWidth(0.2); row:AddChild(rL)
-      local iL = AceGUI:Create("Label"); iL:SetText(data.ilvl or ""); iL:SetRelativeWidth(0.15); row:AddChild(iL)
-      local sL = AceGUI:Create("Label"); sL:SetText("|cffff8800Excluded|r"); sL:SetRelativeWidth(0.15); row:AddChild(sL)
-      local opt = AceGUI:Create("InteractiveLabel"); opt:SetText("|cffbbbbbb...|r"); opt:SetRelativeWidth(0.1);
-      opt:SetCallback("OnClick", function(widget) MyRaidAddon:OpenAssignWindow(name, widget and widget.frame) end); row:AddChild(opt)
-    end
-    if #keys==0 then local none=AceGUI:Create("Label"); none:SetText("No excluded players."); none:SetFullWidth(true); exclScroll:AddChild(none) end
-  end
+  local listWrapper = AceGUI:Create("SimpleGroup")
+  listWrapper:SetLayout("Fill")
+  listWrapper:SetFullWidth(true)
+  listWrapper:SetFullHeight(true)
+  wrap:AddChild(listWrapper)
 
-  local recentBox = AceGUI:Create("InlineGroup"); recentBox:SetTitle("Recent Players (last 20)"); recentBox:SetFullWidth(true); recentBox:SetLayout("Fill"); root:AddChild(recentBox)
-  local recentScroll = AceGUI:Create("ScrollFrame"); recentScroll:SetLayout("Flow"); recentBox:AddChild(recentScroll)
-  local function updateViewer(name)
-    local msgs = store[name] or {}
-    MyRaidAddon._historyViewBox:SetTitle("Whisper Text: "..name)
-    local vs = MyRaidAddon._historyViewScroll; vs:ReleaseChildren()
-    if #msgs == 0 then
-      local none = AceGUI:Create("Label"); none:SetText("(no messages)"); none:SetFullWidth(true); vs:AddChild(none)
-      return
-    end
-    for i=1,#msgs do
-      local m = msgs[i]
-      local ts = date("%Y-%m-%d %H:%M:%S", m.time or GetServerTime())
-      local arrow = (m.dir=="in" and ">>") or (m.dir=="out" and "<<") or "--"
-      local line = AceGUI:Create("Label")
-      line:SetText(string.format("[%s] %s %s", ts, arrow, m.text or ""))
-      line:SetFullWidth(true)
-      vs:AddChild(line)
-    end
-  end
-  do
-    local header = AceGUI:Create("SimpleGroup"); header:SetFullWidth(true); header:SetLayout("Flow"); recentScroll:AddChild(header)
-    local function H2(t,rel) local l=AceGUI:Create("Label"); l:SetText(t); l:SetRelativeWidth(rel); header:AddChild(l) end
-    H2("Name",1.0)
-    -- Build list of players by last whisper time (most recent first)
-    local items = {}
-    for name, msgs in pairs(store) do
-      local lastTime = 0
-      if type(msgs)=="table" and #msgs>0 then
-        local m = msgs[#msgs]
-        lastTime = (m and m.time) or 0
-      end
-      table.insert(items, {name=name, time=lastTime})
-    end
-    table.sort(items, function(a,b) return (a.time or 0) > (b.time or 0) end)
-    local limit = math.min(WHISPER_SHOW or 20, #items)
-    for i=1,limit do
-      local it = items[i]
-      local row = AceGUI:Create("SimpleGroup"); row:SetFullWidth(true); row:SetLayout("Flow"); recentScroll:AddChild(row)
-      local nameLbl = "|c"..getClassColorCode(it.name)..it.name.."|r"
-      local nL = AceGUI:Create("InteractiveLabel"); nL:SetText(nameLbl); nL:SetFullWidth(true); row:AddChild(nL)
-      nL:SetCallback("OnClick", function() updateViewer(it.name) end)
-    end
-    if limit==0 then local none=AceGUI:Create("Label"); none:SetText("No players yet."); none:SetFullWidth(true); recentScroll:AddChild(none) end
-  end
+  local listScroll = AceGUI:Create("ScrollFrame")
+  listScroll:SetLayout("List")
+  listScroll:SetFullWidth(true)
+  listScroll:SetFullHeight(true)
+  listWrapper:AddChild(listScroll)
 
-  local viewBox = AceGUI:Create("InlineGroup"); viewBox:SetTitle("Whisper Text"); viewBox:SetFullWidth(true); viewBox:SetLayout("Fill"); root:AddChild(viewBox)
-  local viewScroll = AceGUI:Create("ScrollFrame"); viewScroll:SetLayout("List"); viewBox:AddChild(viewScroll)
-  MyRaidAddon._histExcluded = exclScroll
-  MyRaidAddon._histRecent   = recentScroll
-  MyRaidAddon._historyViewBox   = viewBox
-  MyRaidAddon._historyViewScroll= viewScroll
+  MyRaidAddon._groupHistoryHeader = header
+  MyRaidAddon._groupHistoryListWrapper = listWrapper
+  MyRaidAddon._groupHistoryList = listScroll
+
+  refreshGroupHistoryView("reset")
   if MyRaidAddon.AdjustHistoryHeights then MyRaidAddon:AdjustHistoryHeights() end
 end
 
@@ -3439,77 +3391,34 @@ local function SelectTab(container, _, group)
   else buildMainTab(container) end
 end
 
--- Adjust the split between Excluded, Recent, and Whisper viewer
+-- Keep the history table responsive on resize
 function MyRaidAddon:AdjustHistoryHeights()
   if not tabGroup or not tabGroup.GetSelected or tabGroup:GetSelected() ~= "history" then return end
 
-  if self.db and self.db.profile and self.db.profile.historyShowGroup then
-    local listBox = self._groupHistoryListBox
-    local detailBox = self._groupHistoryDetailBox
-    local listScroll = self._groupHistoryList
-    local detailScroll = self._groupHistoryDetail
-    if not listBox or not detailBox then return end
-
-    local parentH = (tabGroup and tabGroup.content and tabGroup.content.GetHeight and tabGroup.content:GetHeight())
-                    or (tabGroup and tabGroup.frame and tabGroup.frame:GetHeight())
-                    or (mainFrame and mainFrame.frame and mainFrame.frame:GetHeight())
-                    or 700
-    local toggleRow = self._historyToggleRow
-    if toggleRow and toggleRow.frame and toggleRow.frame:GetHeight() then
-      parentH = parentH - toggleRow.frame:GetHeight() - 20
-    end
-    if parentH < 200 then parentH = 200 end
-
-    listBox:SetHeight(parentH)
-    detailBox:SetHeight(parentH)
-
-    local innerH = parentH - 32
-    if innerH < 120 then innerH = 120 end
-    if listScroll then
-      if listScroll.SetHeight then listScroll:SetHeight(innerH)
-      elseif listScroll.frame and listScroll.frame.SetHeight then listScroll.frame:SetHeight(innerH) end
-    end
-    if detailScroll then
-      if detailScroll.SetHeight then detailScroll:SetHeight(innerH)
-      elseif detailScroll.frame and detailScroll.frame.SetHeight then detailScroll.frame:SetHeight(innerH) end
-    end
-    return
-  end
-
-  local excl   = self._histExcluded
-  local recent = self._histRecent
-  local viewBox= self._historyViewBox
-  if not excl or not recent or not viewBox then return end
-
-  -- Keep top & bottom sized as before, let the middle absorb remaining space so
-  -- Whisper Text stays anchored at the bottom with no trailing gap.
   local parentH = (tabGroup and tabGroup.content and tabGroup.content.GetHeight and tabGroup.content:GetHeight())
                   or (tabGroup and tabGroup.frame and tabGroup.frame:GetHeight())
                   or (mainFrame and mainFrame.frame and mainFrame.frame:GetHeight())
                   or 700
+  local wrapper = self._groupHistoryListWrapper
+  local header  = self._groupHistoryHeader
+  local listScroll = self._groupHistoryList
 
-  local minTop, minMid, minBot = 100, 140, 100
-  local hTop = math.floor(parentH * 0.22)
-  local hBot = math.floor(parentH * 0.24)
-  if hTop < minTop then hTop = minTop end
-  if hBot < minBot then hBot = minBot end
+  if not wrapper or not wrapper.frame then return end
 
-  local hMid = parentH - hTop - hBot
-  if hMid < minMid then
-    local need = minMid - hMid
-    local reduceTop = math.min(math.floor(need/2), math.max(0, hTop - minTop))
-    local reduceBot = math.min(need - reduceTop, math.max(0, hBot - minBot))
-    hTop = hTop - reduceTop
-    hBot = hBot - reduceBot
-    hMid = parentH - hTop - hBot
-    if hMid < minMid then hMid = minMid end
+  local headerHeight = (header and header.frame and header.frame:GetHeight()) or 36
+  local available = parentH - headerHeight - 20
+  if available < 200 then available = 200 end
+
+  wrapper:SetHeight(available)
+  if wrapper.frame then wrapper.frame:SetHeight(available) end
+
+  if listScroll then
+    if listScroll.SetHeight then
+      listScroll:SetHeight(available)
+    elseif listScroll.frame and listScroll.frame.SetHeight then
+      listScroll.frame:SetHeight(available)
+    end
   end
-
-  if hMid < 0 then hMid = minMid end
-
-  excl:SetHeight(hTop)
-  recent:SetHeight(hMid)
-  viewBox:SetHeight(hBot)
 end
 
 function MyRaidAddon:CreateMainWindow()
@@ -3663,7 +3572,6 @@ function MyRaidAddon:OnInitialize()
       roleAssignments   = {},
       historySortKey    = "last",
       historySortAsc    = false,
-      historyShowGroup  = false,
       srLink            = "",
       discordLink       = "",
       raidWarnEnabled   = false,
@@ -3762,7 +3670,7 @@ local function formatGroupHistoryResult(entry)
   return "|cffff5555Wipe|r"
 end
 
-local function roleKeyToLabel(roleKey, combatRole)
+roleKeyToLabel = function(roleKey, combatRole)
   if roleKey == "tank" then return "Tank" end
   if roleKey == "healer" then return "Healer" end
   if roleKey == "melee" then return "Melee DPS" end
@@ -3773,7 +3681,7 @@ local function roleKeyToLabel(roleKey, combatRole)
   return ""
 end
 
-local function colorizeClassName(name, classToken)
+colorizeClassName = function(name, classToken)
   if classToken and RAID_CLASS_COLORS and RAID_CLASS_COLORS[classToken] then
     local c = RAID_CLASS_COLORS[classToken]
     return string.format("|cff%02x%02x%02x%s|r", c.r * 255, c.g * 255, c.b * 255, name)
@@ -3781,181 +3689,74 @@ local function colorizeClassName(name, classToken)
   return name
 end
 
-refreshGroupHistoryView = function(selectIndex)
-  local history = ensureGroupHistory()
-  local maxEntries = #history
-  if type(selectIndex) == "number" then
-    if selectIndex >= 1 and selectIndex <= maxEntries then
-      MyRaidAddon._groupHistorySelectedIndex = selectIndex
-    end
-  elseif selectIndex == "reset" then
-    MyRaidAddon._groupHistorySelectedIndex = (maxEntries > 0) and 1 or nil
-  end
-
-  if maxEntries == 0 then
-    MyRaidAddon._groupHistorySelectedIndex = nil
-  else
-    local sel = MyRaidAddon._groupHistorySelectedIndex or 1
-    if sel < 1 then sel = 1 end
-    if sel > maxEntries then sel = maxEntries end
-    MyRaidAddon._groupHistorySelectedIndex = sel
-  end
-
-  local selIndex = MyRaidAddon._groupHistorySelectedIndex or 1
+refreshGroupHistoryView = function()
   local listScroll = MyRaidAddon._groupHistoryList
-  if listScroll then
-    listScroll:ReleaseChildren()
-    if maxEntries == 0 then
-      local none = AceGUI:Create("Label")
-      none:SetText("No group or raid snapshots recorded yet.")
-      none:SetFullWidth(true)
-      listScroll:AddChild(none)
-    else
-      for idx, entry in ipairs(history) do
-        local ts = entry.timestamp and date("%Y-%m-%d %H:%M", entry.timestamp) or "Unknown time"
-        local inst = entry.instanceName or "Unknown instance"
-        local idText = entry.lockId or (entry.mapID and ("map "..entry.mapID)) or "-"
-        local encounter = entry.encounterName or (entry.reason == "ENCOUNTER_END" and "Encounter") or "-"
-        local diff = entry.difficultyName and ("("..entry.difficultyName..")") or ""
-        local size = entry.raidSize or (entry.roster and #entry.roster) or 0
-        local resultText = formatGroupHistoryResult(entry)
-        local line = string.format(
-          "%s  %s (ID %s)  %s %s  %s  |cffbbbbbb[%d players]|r",
-          ts, inst, idText, encounter, diff, resultText, size
-        )
-        local row = AceGUI:Create("InteractiveLabel")
-        row:SetText(line)
-        row:SetFullWidth(true)
-        if row.SetHighlight then row:SetHighlight(idx == selIndex) end
-        row:SetCallback("OnClick", function()
-          MyRaidAddon._groupHistorySelectedIndex = idx
-          refreshGroupHistoryView()
-        end)
-        listScroll:AddChild(row)
-      end
-    end
+  if not listScroll then return end
+
+  listScroll:ReleaseChildren()
+
+  local history = ensureGroupHistory()
+  if #history == 0 then
+    local none = AceGUI:Create("Label")
+    none:SetText("No raid history recorded yet.")
+    none:SetFullWidth(true)
+    listScroll:AddChild(none)
+    return
   end
 
-  local detailScroll = MyRaidAddon._groupHistoryDetail
-  if detailScroll then
-    detailScroll:ReleaseChildren()
-    if maxEntries == 0 then
-      local none = AceGUI:Create("Label")
-      none:SetText("No roster data available yet.")
-      none:SetFullWidth(true)
-      detailScroll:AddChild(none)
-      return
+  local function addColumn(row, text, relWidth)
+    local lbl = AceGUI:Create("Label")
+    lbl:SetText(text)
+    lbl:SetRelativeWidth(relWidth)
+    row:AddChild(lbl)
+  end
+
+  for _, entry in ipairs(history) do
+    local row = AceGUI:Create("SimpleGroup")
+    row:SetLayout("Flow")
+    row:SetFullWidth(true)
+
+    local ts = entry.timestamp and date("%Y-%m-%d %H:%M", entry.timestamp) or "-"
+    local instanceName = entry.instanceName or "-"
+    if entry.difficultyName and entry.difficultyName ~= "" then
+      instanceName = string.format("%s (%s)", instanceName, entry.difficultyName)
     end
 
-    local entry = history[selIndex]
-    if not entry then
-      local none = AceGUI:Create("Label")
-      none:SetText("No roster data available yet.")
-      none:SetFullWidth(true)
-      detailScroll:AddChild(none)
-      return
+    local encounterText = entry.encounterName
+    if not encounterText or encounterText == "" then
+      encounterText = entry.reason or "-"
     end
 
-    local metaParts = {}
-    table.insert(metaParts, string.format("|cff88ccffInstance:|r %s", entry.instanceName or "-"))
-    table.insert(metaParts, string.format("|cff88ccffRaid/Party ID:|r %s", entry.lockId or (entry.mapID and ("map "..entry.mapID)) or "-"))
-    if entry.encounterName then
-      table.insert(metaParts, string.format("|cff88ccffEncounter:|r %s", entry.encounterName))
-    end
-    if entry.difficultyName then
-      table.insert(metaParts, string.format("|cff88ccffDifficulty:|r %s", entry.difficultyName))
-    end
-    local size = entry.raidSize or (entry.roster and #entry.roster) or 0
-    table.insert(metaParts, string.format("|cff88ccffGroup Size:|r %d", size))
+    local size = entry.raidSize or (entry.roster and #entry.roster) or "-"
+    local resultText = formatGroupHistoryResult(entry)
+
     local ilvlStats = entry.ilvlStats or {}
-    if ilvlStats.total and ilvlStats.total > 0 then
-      table.insert(metaParts, string.format("|cff88ccffilvl:|r total %d | average %d (n=%d)", ilvlStats.total, ilvlStats.average or 0, ilvlStats.count or 0))
-    elseif ilvlStats.average then
-      table.insert(metaParts, string.format("|cff88ccffAverage ilvl:|r %d (n=%d)", ilvlStats.average, ilvlStats.count or 0))
+    local avgIlvl = ilvlStats.average and tonumber(ilvlStats.average) or nil
+    local roleSummary = entry.roleSummary or {}
+    local comp = string.format("%dT/%dH/%dM/%dR",
+      roleSummary.tank or 0,
+      roleSummary.healer or 0,
+      roleSummary.melee or 0,
+      roleSummary.range or 0
+    )
+    local ilvlText
+    if avgIlvl and avgIlvl > 0 then
+      ilvlText = string.format("%d avg | %s", avgIlvl, comp)
+    else
+      ilvlText = comp
     end
-    local rs = entry.roleSummary or {}
-    local tCount = rs.tank or 0
-    local hCount = rs.healer or 0
-    local mCount = rs.melee or 0
-    local rCount = rs.range or 0
-    local compLine = string.format("%dT %dH %dM %dR", tCount, hCount, mCount, rCount)
-    if (rs.other or 0) > 0 then
-      compLine = compLine .. string.format(" (+%d other)", rs.other)
-    end
-    table.insert(metaParts, "|cff88ccffComposition:|r "..compLine)
-    table.insert(metaParts, "|cff88ccffResult:|r "..formatGroupHistoryResult(entry))
 
-    local meta = AceGUI:Create("Label")
-    meta:SetFullWidth(true)
-    meta:SetText(table.concat(metaParts, "\n"))
-    detailScroll:AddChild(meta)
+    addColumn(row, ts, 0.18)
+    addColumn(row, instanceName, 0.25)
+    addColumn(row, encounterText, 0.25)
+    addColumn(row, resultText, 0.10)
+    addColumn(row, tostring(size), 0.08)
+    addColumn(row, ilvlText, 0.14)
 
-    local spacer = AceGUI:Create("Label")
-    spacer:SetFullWidth(true)
-    spacer:SetText(" ")
-    detailScroll:AddChild(spacer)
+    listScroll:AddChild(row)
+  end
 
-    local header = AceGUI:Create("SimpleGroup")
-    header:SetLayout("Flow")
-    header:SetFullWidth(true)
-    local function addHeader(text, rel)
-      local lbl = AceGUI:Create("Label")
-      lbl:SetText(text)
-      lbl:SetRelativeWidth(rel)
-      header:AddChild(lbl)
-    end
-    addHeader("Name", 0.38)
-    addHeader("Role", 0.18)
-    addHeader("ilvl", 0.12)
-    addHeader("Level", 0.10)
-    addHeader("Group", 0.08)
-    addHeader("Status", 0.14)
-    detailScroll:AddChild(header)
-
-    for _, member in ipairs(entry.roster or {}) do
-      local row = AceGUI:Create("SimpleGroup")
-      row:SetLayout("Flow")
-      row:SetFullWidth(true)
-
-      local nameLbl = AceGUI:Create("Label")
-      nameLbl:SetText(colorizeClassName(member.shortName or member.name, member.classToken))
-      nameLbl:SetRelativeWidth(0.38)
-      row:AddChild(nameLbl)
-
-      local roleLbl = AceGUI:Create("Label")
-      roleLbl:SetText(roleKeyToLabel(member.roleKey, member.combatRole))
-      roleLbl:SetRelativeWidth(0.18)
-      row:AddChild(roleLbl)
-
-      local ilLbl = AceGUI:Create("Label")
-      ilLbl:SetText(member.ilvl and tostring(member.ilvl) or "-")
-      ilLbl:SetRelativeWidth(0.12)
-      row:AddChild(ilLbl)
-
-      local lvlLbl = AceGUI:Create("Label")
-      lvlLbl:SetText(member.level and tostring(member.level) or "-")
-      lvlLbl:SetRelativeWidth(0.10)
-      row:AddChild(lvlLbl)
-
-      local grpLbl = AceGUI:Create("Label")
-      grpLbl:SetText(member.subgroup and tostring(member.subgroup) or "-")
-      grpLbl:SetRelativeWidth(0.08)
-      row:AddChild(grpLbl)
-
-      local statusLbl = AceGUI:Create("Label")
-      local statusText
-      if not member.online then
-        statusText = "|cffff5555Offline|r"
-      elseif member.isDead then
-        statusText = "|cffffaa00Dead|r"
-      else
-        statusText = "|cff55ff55Online|r"
-      end
-      statusLbl:SetText(statusText)
-      statusLbl:SetRelativeWidth(0.14)
-      row:AddChild(statusLbl)
-
-      detailScroll:AddChild(row)
-    end
+  if MyRaidAddon and MyRaidAddon.AdjustHistoryHeights then
+    MyRaidAddon:AdjustHistoryHeights()
   end
 end
